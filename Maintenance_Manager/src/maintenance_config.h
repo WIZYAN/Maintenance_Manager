@@ -3,6 +3,7 @@
 
 /* All application-specific settings are collected here. */
 #define MAINTENANCE_DEFAULT_DAYS       180U
+#define MAINTENANCE_SENSOR_DEFAULT_DAYS 180U
 #define MAINTENANCE_MAX_DAYS           36500U
 #define MAINTENANCE_SCREEN_BOOT_MS     2000U
 #define MAINTENANCE_RTC_POLL_MS        1000U
@@ -19,21 +20,19 @@
 #define MAINTENANCE_EEPROM_SLOT1       0x7F40U
 #define MAINTENANCE_EEPROM_PAGE_SIZE   64U
 
-/* The screen page has not been created yet. 0xFFFF disables an output.
- * Use TEXT controls for all three outputs. Set real IDs before enabling.
- * Screen protocol: Dacai configuration protocol, UART CRC DISABLED, 115200 8N1. */
+/* Screen0, display only. All maintenance logic runs on the MCU.
+ * 0xFFFF disables an output. Dacai protocol, CRC disabled, 115200 8N1.
+ * RTC control 10 displays the same system RTC read by command EE 82. */
 #ifndef MAINTENANCE_SCREEN_ID
-#define MAINTENANCE_SCREEN_ID          0xFFFFU
+#define MAINTENANCE_SCREEN_ID 0U
 #endif
-#ifndef MAINTENANCE_REMAIN_CONTROL_ID
-#define MAINTENANCE_REMAIN_CONTROL_ID  0xFFFFU
-#endif
-#ifndef MAINTENANCE_PERIOD_CONTROL_ID
-#define MAINTENANCE_PERIOD_CONTROL_ID  0xFFFFU
-#endif
-#ifndef MAINTENANCE_STATUS_CONTROL_ID
-#define MAINTENANCE_STATUS_CONTROL_ID  0xFFFFU
-#endif
+#define MAINTENANCE_MACHINE_PERIOD_ID   1U
+#define MAINTENANCE_MACHINE_PROGRESS_ID 2U
+#define MAINTENANCE_SENSOR_PROGRESS_ID  3U
+#define MAINTENANCE_SENSOR_PERIOD_ID    4U
+#define MAINTENANCE_MACHINE_BAR_ID      5U
+#define MAINTENANCE_SENSOR_BAR_ID       6U
+#define MAINTENANCE_RTC_CONTROL_ID     10U
 
 #define MAINTENANCE_RX_SIZE            512U
 #define MAINTENANCE_FRAME_SIZE         1024U

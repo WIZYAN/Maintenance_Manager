@@ -26,9 +26,7 @@ def main():
             ["Maintenance.c", "maintenance_storage.c", "maintenance_protocol.c"]]
     for display in [False, True]:
         binary = OUT / ("test-display.exe" if display else "test-core.exe")
-        defines = (["-DMAINTENANCE_SCREEN_ID=1", "-DMAINTENANCE_REMAIN_CONTROL_ID=11",
-                    "-DMAINTENANCE_PERIOD_CONTROL_ID=12", "-DMAINTENANCE_STATUS_CONTROL_ID=13"]
-                   if display else [])
+        defines = [] if display else ["-DMAINTENANCE_SCREEN_ID=0xFFFF"]
         run([args.host_gcc, "-std=c99", "-Wall", "-Wextra", "-Werror", "-O2",
              "-I", PROJECT / "src", *defines, *core, ROOT / "tests/test_maintenance.c", "-o", binary])
         run([binary])

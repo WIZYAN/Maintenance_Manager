@@ -4,9 +4,9 @@
 
 - 时间标准仅来自串口屏 RTC，按日历日期计算，每跨过午夜减少一天。
 - 断电期间继续计入保养周期：上电读取 EEPROM 记录和屏幕当前日期重新计算。
-- 初始周期为 180 天。首次使用且两个 EEPROM 保留页全部为 `0xFF` 时，等到有效 RTC 回包后开始计时并保存。
+- 整机与传感器独立计时，两者初始周期均为 180 天。首次使用且两个 EEPROM 保留页全部为 `0xFF` 时，等到有效 RTC 回包后开始计时并保存。
 - 修改周期保留起始日期：经过 30 天后从 180 改为 150，剩余 120 天。
-- 到期显示 0 天，状态为 `MAINTENANCE_DUE`，不会自动开始下一轮。
+- 剩余天数到期为 0；屏幕显示已过天数/周期，到期封顶为 180/180，进度条封顶 100%，不会自动开始下一轮。
 - 确认完成保养后，从当天重新计时。
 - RTC 无效、超时或日期回退时，`countdown_valid=false`，不将旧的剩余天数当作有效值。
 - 已损坏/非本模块格式的 EEPROM 数据不会被当作首次使用自动覆盖。
@@ -30,15 +30,18 @@ Maintenance_result_t result;
 result = Maintenance_SetPeriodDays(150);
 /* 只有 result == MAINTENANCE_OK 时，才提示用户“设置已保存”。 */
 
-result = Maintenance_Reset();
+result = Maintenance_SetSensorPeriodDays(90); /* 仅修改传感器周期 */
+
+result = Maintenance_Reset(); /* 仅确认整机保养完成 */
+result = Maintenance_ResetSensor(); /* 仅确认传感器保养完成 */
 /* 只有 result == MAINTENANCE_OK 时，才提示用户“保养记录已更新”。 */
 ```
 
 不要每次循环都调用 `Maintenance_Reset()`，只在用户确认完成保养的事件发生时调用。
-不要在串口中断或 SysTick 中调用以上业务函数。两个操作函数需要最近 3 秒内取得有效 RTC 时间。
+不要在串口中断或 SysTick 中调用以上业务函数。四个操作接口需要最近 3 秒内取得有效 RTC 时间。
 设置相同周期直接成功返回，不重复写 EEPROM。周期范围为 1～36500 天。
 
-两个 EEPROM 页都损坏时，`Maintenance_Reset()` 是用户明确确认后的恢复入口，会使用默认 180 天周期重新建立记录；
+两个 EEPROM 页都损坏时，任一 Reset 接口是用户明确确认后的恢复入口，会同时使用两路默认周期、以当天为起点重新建立整份记录；
 不会自动恢复原来已无法读出的周期。仅通信故障时先恢复 I²C，模块每 5 秒重试加载记录。
 
 ## 两组结构体
@@ -47,17 +50,20 @@ result = Maintenance_Reset();
 
 | 变量 | 字段 | 含义 |
 |---|---|---|
-| `Maintenance_save` | `period_days` | 保存的保养周期 |
-| | `start_day` | 本轮起始日期，以 2000-01-01 为第 0 天 |
-| | `saved_day` | 最近一次设置时的日期 |
-| | `sequence` | 保存记录的序号 |
-| `Maintenance_para` | `rtc` | 最近一次有效的屏幕年月日、时分秒 |
-| | `remaining_days` | 剩余天数，读取前检查 `countdown_valid` |
-| | `current_day / due_day / elapsed_days` | 当前日期、到期日期和已过天数 |
-| | `status` | 等待、运行、到期、RTC 故障、存储故障、硬件故障 |
+| `Maintenance_save` | `machine.period_days / machine.start_day` | 整机周期与起始日期 |
+| | `sensor.period_days / sensor.start_day` | 传感器周期与起始日期 |
+| | `saved_day / sequence` | 最近一次保存日期、记录序号 |
+| `Maintenance_para` | `rtc / current_day` | 最近屏幕 RTC 时间、当前日期序号 |
+| | `machine / sensor` | 两路过程变量，各含下列字段 |
+| | `*.remaining_days / *.elapsed_days / *.due_day` | 剩余天数、实际已过天数、到期日期 |
+| | `*.progress_percent` | MCU 计算的 0～100 整数百分比，向下取整 |
+| | `*.countdown_valid / *.status` | 单路数据有效标志与状态 |
+| | `status` | 总状态：任一路到期则为 DUE；故障优先 |
 | | `last_result` | 最近一次设置/存储操作结果 |
-| | `rtc_valid / record_valid / countdown_valid` | 时间、存储记录和倒计时是否有效 |
-| | 其他字段 | 状态机、串口收发、时基等过程变量 |
+| | `rtc_valid / record_valid / countdown_valid` | 时间、存储记录、两路计算结果是否有效 |
+| | 其他字段 | 状态机、串口、时基等过程变量 |
+
+日期序号以 2000-01-01 为第 0 天。读取单路数值前检查对应 `countdown_valid`；无效时数值可能仍是旧值。
 
 这两个变量由模块管理，应用程序可以读取；**设置请调用函数，不要直接修改字段**，否则不会完成掉电保存和一致性校验。
 
@@ -78,27 +84,42 @@ EEPROM 使用独立序列化格式，不直接保存 C 结构体内存，因此�
 
 保存顺序：使目标备用页失效并确认 → 写入新数据并回读 → 写入提交标记 → 回读并校验完整记录。
 当前有效页始终保留。上电选择序号最新的有效记录，损坏时回退到另一份完整记录。
-日常 RTC 轮询和剩余天数变化不写 EEPROM，仅首次建立、修改周期、确认保养完成时写入。
+日常 RTC 轮询和剩余天数变化不写 EEPROM，仅首次建立、修改周期、确认保养完成、旧格式迁移时写入。
+
+记录已升级到 v2，两个项目保存在同一份双备份记录中。读取旧 v1 时保留整机周期和起始日期；取得有效 RTC 后，从当天初始化新增传感器项目，并写入另一页。迁移中断电仍可读取原来的 v1，不会重启整机计时。
 
 保存中断电时，新设置可能没有提交，应以重启读出的完整记录为准。
 如果提交完成但最后回读失败，接口仍返回错误；模块后续重新加载 EEPROM，恢复到实际已提交的记录。
 
-## 串口屏画面尚未制作
+## 已接入 VisualTFT Screen0
 
-核心计时和存储已启用，**显示控件 ID 默认 0xFFFF，暂不发送控件更新指令**。
-页面做好后，在 `src/maintenance_config.h` 填写：
+打开仓库中的 `VisualTFT/Project/Project.tftprj`，设备为 DC10600PM101、1024×600。
+画面 ID 为 0，MCU 每秒轮流刷新六个输出控件：
 
-```c
-#define MAINTENANCE_SCREEN_ID          /* 画面 ID */
-#define MAINTENANCE_REMAIN_CONTROL_ID  /* 剩余天数文本控件 ID */
-#define MAINTENANCE_PERIOD_CONTROL_ID  /* 保养周期文本控件 ID */
-#define MAINTENANCE_STATUS_CONTROL_ID  /* 状态文本控件 ID */
-```
+| 控件 ID | 作用 | 已过 30 天、周期 180 天时 |
+|---|---|---|
+| 1 | 整机周期、比值分母 | `180` |
+| 2 | 整机已过天数及斜杠 | `30/`，与右侧控件 1 拼成 `30/180` |
+| 3 | 传感器已过天数及斜杠 | `30/`，与右侧控件 4 拼接 |
+| 4 | 传感器周期、比值分母 | `180` |
+| 5 | 整机进度条 | 16（范围 0～100） |
+| 6 | 传感器进度条 | 16（范围 0～100） |
+| 7、8、9 | 原有说明及售后电话文本 | 原样保留，MCU 不写入 |
+| 10 | 屏幕 RTC 日期时间 | 原样保留 |
 
-三个输出均使用 **文本控件**，采用 `EE B1 10 Screen_id Control_id Strings FF FC FF FF` 更新，ID 为大端两字节。
-剩余天数无效时显示 `--`；状态文本为 `WAIT RTC / RUNNING / DUE / RTC ERROR / EEPROM ERROR / HW ERROR`。
-目前未绑定屏幕按钮和输入框回包；制作页面后在主循环解析其事件，再调用两个操作函数。
-现有接收器会安全跳过其他控件报文，不会将按钮报文误当 RTC。
+控件 1/2、3/4 分别相邻对齐。两路默认值均为 180 天，可在 `maintenance_config.h` 分别配置。
+未得到有效时间或发生存储故障时，分子显示 `--/`、进度为 0；无有效记录时分母也显示 `--`。
+界面没有新增故障文字，应用可读取 `Maintenance_para.status` 判断原因。
+实际已过天数保存在 `elapsed_days`，仅屏幕分子在周期处封顶。周期从 180 改为 150 后仍保留起始日期：已过 30 天即显示 `30/150`，剩余 120 天，进度 20%。
+
+**所有保养业务逻辑都在 MCU：屏幕没有新增 Lua、计时器、变量绑定或控件联动。**
+控件 10 展示的是屏幕系统 RTC，MCU 用 `EE 82` 读取同一个时钟，不解析显示文字，也不向控件 10 写入时间。
+保养计算以日历日期为准；控件 10 的显示刷新频率不会影响 MCU 的每秒 RTC 查询。
+目前页面没有设置/确认保养按钮，设置与复位通过 MCU 接口调用。
+
+文本更新使用 `EE B1 10` 加画面 ID、控件 ID、ASCII 字符串、帧尾；
+进度条使用相同命令但数值为 **4 字节大端整数**。不会向屏幕发送百分比 ASCII 字符串来更新进度条。
+屏幕波特率已从原来的 9600 改为 115200（本机 VisualTFT 配置枚举 3 → 7），与 MCU 一致，CRC 保持关闭。
 
 屏幕使用**大彩组态协议、关闭串口 CRC、115200 / 8N1**：
 
@@ -111,7 +132,7 @@ RTC 回包：EE F7 年 月 星期 日 时 分 秒 FF FC FF FF
 代码检查报文长度、帧尾、BCD、月份天数和闰年，不使用屏幕普通计时控件累计天数。
 协议依据：[大彩官方 RTC 说明](https://doc.gz-dc.com/Control/06_RTC.html)、
 [大彩指令集 V5.1，2.39 读取 RTC](https://www.gz-dc.com/UPLOADS/FILE/20200702/%E5%A4%A7%E5%BD%A9%E4%B8%B2%E5%8F%A3%E5%B1%8F%E6%8C%87%E4%BB%A4%E9%9B%86V5.1%20.PDF)。
-尚未取得 DC10600PM101 的专用手册，需实机确认它使用上述协议及 RTC 格式。
+本机 VisualTFT 的设备数据库已确认型号对应 TypeID=19512，支持 RTC。通信仍需实机联调确认。
 
 ## RTC 校时规则与边界
 
@@ -136,7 +157,10 @@ python tools/check_maintenance.py
 可用 `--arm-gcc`、`--host-gcc` 指定其他工具链；`--host-only` 只运行主机测试。
 
 已覆盖：2000～2099 所有有效日期、闰年、跨年、修改周期、到期、保养复位、断电日期推进、
-RTC 拆包/坏包/超时/超长帧、串口丢字节标记、CRC 损坏、每一个写入字节位置的掉电模拟、
-存储读取失败恢复、毫秒回绕、可选文本显示。
+RTC 拆包/坏包/超时/超长帧、串口丢字节标记、CRC 损坏、两路设置及旧格式迁移的逐字节掉电模拟、
+存储读取失败恢复、毫秒回绕、六个控件的文本/二进制报文、到期封顶及无效时间显示。
+
+屏幕源码已使用本机 VisualTFT 3.0.0.1253 的 `TFTCompiler.exe` 编译，生成 `VisualTFT/Project/output/Project.si` 和控件 ID 定义，未下载到实屏。输出目录已加入 `.gitignore`。
+`tests/` 沿用当前忽略规则，测试源文件只在本机；在其他电脑运行检查脚本前需同时带上该目录。
 
 主机模拟不验证真实 I²C 电气时序、屏幕协议兼容性及 EEPROM 实际掉电行为；这些要在实板验证。

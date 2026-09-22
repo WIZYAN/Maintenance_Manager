@@ -27,6 +27,8 @@
 # Local test builds, PDF previews and downloaded reference copies
 /tmp/
 /tests/
+# Generated VisualTFT screen/download resources; keep source fonts and images.
+/VisualTFT/Project/output/
 # Python / editor / operating-system caches
 __pycache__/
 *.py[cod]

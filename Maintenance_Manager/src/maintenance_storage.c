@@ -3,8 +3,9 @@
 
 /* Explicit little-endian storage layout (32 bytes + marker at page byte 63):
  * 0 magic MNT1; 4 version u16; 6 length u16; 8 sequence u32;
- * 12 start_day u32; 16 saved_day u32; 20 period u16;
- * 22..27 reserved zero; 28 CRC32 of bytes 0..27. */
+ * 12 machine start_day u32; 16 saved_day u32; 20 machine period u16;
+ * v2: 22 sensor start_day u32; 26 sensor period u16; 28 CRC32 of bytes 0..27.
+ * v1: 22..27 reserved zero. Migrated after a fresh RTC sample. */
 #define RECORD_SIZE 32U
 #define COMMIT_OFFSET 63U
 #define COMMIT_MARKER 0xA5U
@@ -57,15 +58,27 @@ static bool decode(const uint8_t *page, Maintenance_save_t *save)
 {
     uint8_t i;
     if ((page[COMMIT_OFFSET] != COMMIT_MARKER) || (memcmp(page, "MNT1", 4) != 0) ||
-        (page[4] != 1U) || (page[5] != 0U) || (page[6] != RECORD_SIZE) || (page[7] != 0U) ||
+        ((page[4] != 1U) && (page[4] != 2U)) || (page[5] != 0U) || (page[6] != RECORD_SIZE) || (page[7] != 0U) ||
         (get32(&page[28]) != crc32(page, 28U))) { return false; }
-    for (i = 22U; i < 28U; ++i) { if (page[i] != 0U) { return false; } }
+    if (page[4] == 1U)
+    {
+        for (i = 22U; i < 28U; ++i) { if (page[i] != 0U) { return false; } }
+        save->sensor.start_day = UINT32_MAX;
+        save->sensor.period_days = MAINTENANCE_SENSOR_DEFAULT_DAYS;
+    }
+    else
+    {
+        save->sensor.start_day = get32(&page[22]);
+        save->sensor.period_days = (uint16_t) ((uint16_t) page[26] | ((uint16_t) page[27] << 8));
+        if ((save->sensor.period_days == 0U) || (save->sensor.period_days > MAINTENANCE_MAX_DAYS) ||
+            (save->sensor.start_day > get32(&page[16]))) { return false; }
+    }
     save->sequence = get32(&page[8]);
-    save->start_day = get32(&page[12]);
+    save->machine.start_day = get32(&page[12]);
     save->saved_day = get32(&page[16]);
-    save->period_days = (uint16_t) ((uint16_t) page[20] | ((uint16_t) page[21] << 8));
-    return (save->period_days > 0U) && (save->period_days <= MAINTENANCE_MAX_DAYS) &&
-           (save->start_day <= save->saved_day) && (save->saved_day < 36525U);
+    save->machine.period_days = (uint16_t) ((uint16_t) page[20] | ((uint16_t) page[21] << 8));
+    return (save->machine.period_days > 0U) && (save->machine.period_days <= MAINTENANCE_MAX_DAYS) &&
+           (save->machine.start_day <= save->saved_day) && (save->saved_day < 36525U);
 }
 
 bool Maintenance_StorageLoad(void)
@@ -88,6 +101,7 @@ bool Maintenance_StorageLoad(void)
     Maintenance_para.storage_corrupt = false;
     Maintenance_para.storage_blank = false;
     Maintenance_para.record_valid = false;
+    Maintenance_para.migration_pending = false;
     Maintenance_para.active_slot = -1;
     if (valid[0] || valid[1])
     {
@@ -96,13 +110,15 @@ bool Maintenance_StorageLoad(void)
                 ((uint32_t) (records[1].sequence - records[0].sequence) != 0U) &&
                 ((uint32_t) (records[1].sequence - records[0].sequence) < 0x80000000UL))) ? 1U : 0U;
         Maintenance_save = records[slot];
+        Maintenance_para.migration_pending = (pages[slot][4] == 1U);
         Maintenance_para.active_slot = (int8_t) slot;
         Maintenance_para.record_valid = true;
         Maintenance_para.last_result = MAINTENANCE_OK;
         return true;
     }
     memset(&Maintenance_save, 0, sizeof(Maintenance_save));
-    Maintenance_save.period_days = MAINTENANCE_DEFAULT_DAYS;
+    Maintenance_save.machine.period_days = MAINTENANCE_DEFAULT_DAYS;
+    Maintenance_save.sensor.period_days = MAINTENANCE_SENSOR_DEFAULT_DAYS;
     if (erased(pages[0]) && erased(pages[1]))
     {
         Maintenance_para.storage_blank = true;
@@ -126,13 +142,16 @@ bool Maintenance_StorageCommit(Maintenance_save_t *candidate)
     uint16_t address = (next_slot == 0) ? MAINTENANCE_EEPROM_SLOT0 : MAINTENANCE_EEPROM_SLOT1;
     uint32_t sequence = Maintenance_para.record_valid ? Maintenance_save.sequence + 1U : 1U;
     memcpy(record, "MNT1", 4);
-    record[4] = 1U;
+    record[4] = 2U;
     record[6] = RECORD_SIZE;
     put32(&record[8], sequence);
-    put32(&record[12], candidate->start_day);
+    put32(&record[12], candidate->machine.start_day);
     put32(&record[16], candidate->saved_day);
-    record[20] = (uint8_t) candidate->period_days;
-    record[21] = (uint8_t) (candidate->period_days >> 8);
+    record[20] = (uint8_t) candidate->machine.period_days;
+    record[21] = (uint8_t) (candidate->machine.period_days >> 8);
+    put32(&record[22], candidate->sensor.start_day);
+    record[26] = (uint8_t) candidate->sensor.period_days;
+    record[27] = (uint8_t) (candidate->sensor.period_days >> 8);
     put32(&record[28], crc32(record, 28U));
 
     /* Never invalidate the currently active page. Invalidate destination first,

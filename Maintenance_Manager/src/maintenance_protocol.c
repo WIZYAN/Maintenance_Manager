@@ -99,40 +99,59 @@ static void decimal(uint16_t number, char *text)
     text[index] = '\0';
 }
 
+static bool send_progress(uint16_t control, uint8_t percent)
+{
+    uint8_t frame[] = {0xEE,0xB1,0x10,0,0,0,0,0,0,0,0,0xFF,0xFC,0xFF,0xFF};
+    if ((MAINTENANCE_SCREEN_ID == 0xFFFFU) || (control == 0xFFFFU)) { return true; }
+    frame[3] = (uint8_t) (MAINTENANCE_SCREEN_ID >> 8);
+    frame[4] = (uint8_t) MAINTENANCE_SCREEN_ID;
+    frame[5] = (uint8_t) (control >> 8); frame[6] = (uint8_t) control;
+    /* Progress value is a FOUR-byte big-endian integer, not ASCII. */
+    frame[10] = percent;
+    return Maintenance_PortSend(frame, sizeof(frame));
+}
+
 static void display_task(uint32_t now)
 {
-    static const char *const status_text[] =
-        {"WAIT RTC", "RUNNING", "DUE", "RTC ERROR", "EEPROM ERROR", "HW ERROR"};
+    static const uint16_t controls[6] = {
+        MAINTENANCE_MACHINE_PROGRESS_ID, MAINTENANCE_MACHINE_PERIOD_ID, MAINTENANCE_MACHINE_BAR_ID,
+        MAINTENANCE_SENSOR_PROGRESS_ID, MAINTENANCE_SENSOR_PERIOD_ID, MAINTENANCE_SENSOR_BAR_ID};
+    const Maintenance_item_save_t *save;
+    const Maintenance_item_para_t *para;
+    uint8_t field = Maintenance_para.display_field;
     char value[16];
     bool sent;
     if (MAINTENANCE_SCREEN_ID == 0xFFFFU) { return; }
-    if ((Maintenance_para.display_field == 0U) &&
+    if ((field == 0U) &&
         ((uint32_t) (now - Maintenance_para.display_ms) < MAINTENANCE_DISPLAY_PERIOD_MS)) { return; }
-    switch (Maintenance_para.display_field)
+    save = (field < 3U) ? &Maintenance_save.machine : &Maintenance_save.sensor;
+    para = (field < 3U) ? &Maintenance_para.machine : &Maintenance_para.sensor;
+    switch (field % 3U)
     {
         case 0:
-            if (Maintenance_para.countdown_valid)
+            if (para->countdown_valid)
             {
-                decimal(Maintenance_para.remaining_days, value);
+                uint16_t elapsed = (para->elapsed_days >= save->period_days) ?
+                    save->period_days : (uint16_t) para->elapsed_days;
+                decimal(elapsed, value);
+                strcat(value, "/");
             }
-            else { value[0] = '-'; value[1] = '-'; value[2] = '\0'; }
-            sent = send_text(MAINTENANCE_REMAIN_CONTROL_ID, value);
+            else { strcpy(value, "--/"); }
+            sent = send_text(controls[field], value);
             break;
         case 1:
-            decimal(Maintenance_save.period_days, value);
-            sent = send_text(MAINTENANCE_PERIOD_CONTROL_ID, value);
+            if (Maintenance_para.record_valid) { decimal(save->period_days, value); }
+            else { strcpy(value, "--"); }
+            sent = send_text(controls[field], value);
             break;
         default:
-            sent = send_text(MAINTENANCE_STATUS_CONTROL_ID, status_text[Maintenance_para.status]);
+            sent = send_progress(controls[field], para->countdown_valid ? para->progress_percent : 0U);
             break;
     }
-    if (sent)
+    if (sent && (++Maintenance_para.display_field >= 6U))
     {
-        if (++Maintenance_para.display_field >= 3U)
-        {
-            Maintenance_para.display_field = 0;
-            Maintenance_para.display_ms = now;
-        }
+        Maintenance_para.display_field = 0;
+        Maintenance_para.display_ms = now;
     }
 }
 

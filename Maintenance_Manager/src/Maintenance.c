@@ -58,9 +58,23 @@ void Maintenance_AcceptRtc(const Maintenance_date_t *date, uint32_t now)
     Maintenance_para.last_rtc_ms = now;
 }
 
+static void update_item(const Maintenance_item_save_t *save, Maintenance_item_para_t *para)
+{
+    para->due_day = save->start_day + save->period_days;
+    para->elapsed_days = Maintenance_para.current_day - save->start_day;
+    para->remaining_days = (Maintenance_para.current_day >= para->due_day) ?
+        0U : (uint16_t) (para->due_day - Maintenance_para.current_day);
+    para->progress_percent = (para->elapsed_days >= save->period_days) ? 100U :
+        (uint8_t) ((para->elapsed_days * 100U) / save->period_days);
+    para->countdown_valid = true;
+    para->status = (para->remaining_days == 0U) ? MAINTENANCE_DUE : MAINTENANCE_RUNNING;
+}
+
 void Maintenance_UpdateStatus(uint32_t now)
 {
     Maintenance_para.countdown_valid = false;
+    Maintenance_para.machine.countdown_valid = false;
+    Maintenance_para.sensor.countdown_valid = false;
     if (!Maintenance_para.port_ready)
     {
         Maintenance_para.status = MAINTENANCE_HARDWARE_FAULT;
@@ -76,7 +90,7 @@ void Maintenance_UpdateStatus(uint32_t now)
         Maintenance_para.status = Maintenance_para.have_rtc ? MAINTENANCE_RTC_FAULT : MAINTENANCE_WAITING;
         if (Maintenance_para.rtc_error_count != 0U) { Maintenance_para.status = MAINTENANCE_RTC_FAULT; }
     }
-    else if (!Maintenance_para.record_valid)
+    else if (!Maintenance_para.record_valid || Maintenance_para.migration_pending)
     {
         Maintenance_para.status = MAINTENANCE_WAITING;
     }
@@ -87,12 +101,16 @@ void Maintenance_UpdateStatus(uint32_t now)
     }
     else
     {
-        Maintenance_para.due_day = Maintenance_save.start_day + Maintenance_save.period_days;
-        Maintenance_para.elapsed_days = Maintenance_para.current_day - Maintenance_save.start_day;
-        Maintenance_para.remaining_days = (Maintenance_para.current_day >= Maintenance_para.due_day) ?
-            0U : (uint16_t) (Maintenance_para.due_day - Maintenance_para.current_day);
+        update_item(&Maintenance_save.machine, &Maintenance_para.machine);
+        update_item(&Maintenance_save.sensor, &Maintenance_para.sensor);
         Maintenance_para.countdown_valid = true;
-        Maintenance_para.status = (Maintenance_para.remaining_days == 0U) ? MAINTENANCE_DUE : MAINTENANCE_RUNNING;
+        Maintenance_para.status = ((Maintenance_para.machine.status == MAINTENANCE_DUE) ||
+            (Maintenance_para.sensor.status == MAINTENANCE_DUE)) ? MAINTENANCE_DUE : MAINTENANCE_RUNNING;
+    }
+    if (!Maintenance_para.countdown_valid)
+    {
+        Maintenance_para.machine.status = Maintenance_para.status;
+        Maintenance_para.sensor.status = Maintenance_para.status;
     }
 }
 
@@ -125,13 +143,16 @@ static Maintenance_result_t commit(Maintenance_save_t *candidate)
         Maintenance_para.storage_blank = false;
         Maintenance_para.storage_fault = false;
         Maintenance_para.storage_corrupt = false;
+        Maintenance_para.migration_pending = false;
+        Maintenance_para.display_field = 0;
+        Maintenance_para.display_ms = Maintenance_PortNow() - MAINTENANCE_DISPLAY_PERIOD_MS;
         Maintenance_para.last_result = MAINTENANCE_OK;
     }
     Maintenance_UpdateStatus(Maintenance_PortNow());
     return Maintenance_para.last_result;
 }
 
-Maintenance_result_t Maintenance_SetPeriodDays(uint16_t days)
+static Maintenance_result_t set_period(uint16_t days, bool sensor)
 {
     Maintenance_save_t candidate;
     Maintenance_result_t result;
@@ -139,19 +160,21 @@ Maintenance_result_t Maintenance_SetPeriodDays(uint16_t days)
     else if ((result = time_ready()) != MAINTENANCE_OK) { /* Return specific readiness error. */ }
     else if (Maintenance_para.storage_corrupt) { result = MAINTENANCE_STORAGE_CORRUPT; }
     else if (Maintenance_para.storage_fault) { result = MAINTENANCE_STORAGE_ERROR; }
-    else if (!Maintenance_para.record_valid) { result = MAINTENANCE_NOT_READY; }
-    else if (days == Maintenance_save.period_days) { result = MAINTENANCE_OK; }
+    else if (!Maintenance_para.record_valid || Maintenance_para.migration_pending) { result = MAINTENANCE_NOT_READY; }
+    else if (days == (sensor ? Maintenance_save.sensor.period_days : Maintenance_save.machine.period_days))
+    { result = MAINTENANCE_OK; }
     else
     {
         candidate = Maintenance_save;
-        candidate.period_days = days;
+        if (sensor) { candidate.sensor.period_days = days; }
+        else { candidate.machine.period_days = days; }
         return commit(&candidate);
     }
     Maintenance_para.last_result = result;
     return result;
 }
 
-Maintenance_result_t Maintenance_Reset(void)
+static Maintenance_result_t reset_item(bool sensor)
 {
     Maintenance_save_t candidate;
     Maintenance_result_t result = time_ready();
@@ -161,16 +184,29 @@ Maintenance_result_t Maintenance_Reset(void)
         {
             result = MAINTENANCE_STORAGE_ERROR;
         }
+        else if (Maintenance_para.migration_pending) { result = MAINTENANCE_NOT_READY; }
         else
         {
             candidate = Maintenance_save;
-            candidate.start_day = Maintenance_para.current_day;
+            /* Explicit recovery of missing/corrupt records initializes BOTH items. */
+            if (!Maintenance_para.record_valid)
+            {
+                candidate.machine.start_day = Maintenance_para.current_day;
+                candidate.sensor.start_day = Maintenance_para.current_day;
+            }
+            else if (sensor) { candidate.sensor.start_day = Maintenance_para.current_day; }
+            else { candidate.machine.start_day = Maintenance_para.current_day; }
             return commit(&candidate);
         }
     }
     Maintenance_para.last_result = result;
     return result;
 }
+
+Maintenance_result_t Maintenance_SetPeriodDays(uint16_t days) { return set_period(days, false); }
+Maintenance_result_t Maintenance_SetSensorPeriodDays(uint16_t days) { return set_period(days, true); }
+Maintenance_result_t Maintenance_Reset(void) { return reset_item(false); }
+Maintenance_result_t Maintenance_ResetSensor(void) { return reset_item(true); }
 
 void Maintenance_Task(void)
 {
@@ -179,7 +215,8 @@ void Maintenance_Task(void)
     {
         memset(&Maintenance_para, 0, sizeof(Maintenance_para));
         memset(&Maintenance_save, 0, sizeof(Maintenance_save));
-        Maintenance_save.period_days = MAINTENANCE_DEFAULT_DAYS;
+        Maintenance_save.machine.period_days = MAINTENANCE_DEFAULT_DAYS;
+        Maintenance_save.sensor.period_days = MAINTENANCE_SENSOR_DEFAULT_DAYS;
         Maintenance_para.active_slot = -1;
         Maintenance_para.initialized = true;
         Maintenance_para.port_ready = Maintenance_PortInit();
@@ -197,12 +234,13 @@ void Maintenance_Task(void)
     }
     Maintenance_ProtocolTask(now);
     Maintenance_UpdateStatus(now);
-    if (Maintenance_para.storage_blank && !Maintenance_para.storage_fault &&
-        !Maintenance_para.record_valid && Maintenance_para.rtc_valid &&
+    if (((Maintenance_para.storage_blank && !Maintenance_para.record_valid) || Maintenance_para.migration_pending) &&
+        !Maintenance_para.storage_fault && Maintenance_para.rtc_valid &&
         ((uint32_t) (now - Maintenance_para.last_rtc_ms) <= MAINTENANCE_RTC_FRESH_MS))
     {
         Maintenance_save_t candidate = Maintenance_save;
-        candidate.start_day = Maintenance_para.current_day;
+        if (!Maintenance_para.migration_pending) { candidate.machine.start_day = Maintenance_para.current_day; }
+        candidate.sensor.start_day = Maintenance_para.current_day;
         (void) commit(&candidate);
     }
 }

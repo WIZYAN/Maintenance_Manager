@@ -32,12 +32,26 @@ typedef struct
     uint8_t month, day, hour, minute, second;
 } Maintenance_date_t;
 
+typedef struct
+{
+    uint16_t period_days;
+    uint32_t start_day;
+} Maintenance_item_save_t;
+
+typedef struct
+{
+    uint32_t due_day, elapsed_days;
+    uint16_t remaining_days;
+    uint8_t progress_percent;
+    bool countdown_valid;
+    Maintenance_status_t status;
+} Maintenance_item_para_t;
+
 /* 第一组：掉电保存的数据。由接口修改，禁止直接赋值绕过保存流程。
  * EEPROM uses an explicit byte format, NOT the raw struct layout. */
 typedef struct
 {
-    uint16_t period_days;              /* 保养周期，默认 180 天 */
-    uint32_t start_day;                /* 起始日期：自 2000-01-01 的天数 */
+    Maintenance_item_save_t machine, sensor;
     uint32_t saved_day;                /* 最近设置时的日期，用于校时检查 */
     uint32_t sequence;                 /* 双备份记录的序号 */
 } Maintenance_save_t;
@@ -47,8 +61,8 @@ typedef struct
 typedef struct
 {
     Maintenance_date_t rtc;
-    uint32_t current_day, due_day, elapsed_days;
-    uint16_t remaining_days;
+    uint32_t current_day;
+    Maintenance_item_para_t machine, sensor;
     bool rtc_valid, record_valid, countdown_valid;
     Maintenance_status_t status;
     Maintenance_result_t last_result;
@@ -57,6 +71,7 @@ typedef struct
     /* Internal task/storage/protocol state, also kept in this group. */
     bool initialized, port_ready, screen_ready, storage_loaded, storage_blank;
     bool storage_fault, storage_corrupt, rtc_pending, have_rtc;
+    bool migration_pending;
     int8_t active_slot;
     uint32_t started_ms, last_rtc_request_ms, last_rtc_ms;
     uint32_t storage_retry_ms, frame_last_ms, display_ms;
@@ -90,5 +105,10 @@ Maintenance_result_t Maintenance_SetPeriodDays(uint16_t days);
 /* Confirm completed maintenance and restart from today's screen RTC date.
  * Also explicitly recovers corrupt records using the default period. */
 Maintenance_result_t Maintenance_Reset(void);
+
+/* Independent sensor interval and completed-maintenance confirmation.
+ * The original SetPeriodDays/Reset functions apply to the machine. */
+Maintenance_result_t Maintenance_SetSensorPeriodDays(uint16_t days);
+Maintenance_result_t Maintenance_ResetSensor(void);
 
 #endif
