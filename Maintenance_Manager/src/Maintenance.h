@@ -36,14 +36,18 @@ typedef struct
 {
     uint16_t period_days;
     uint32_t start_day;
+    uint16_t period_hours;
+    uint32_t start_uptime_seconds;
 } Maintenance_item_save_t;
 
 typedef struct
 {
     uint32_t due_day, elapsed_days;
     uint16_t remaining_days;
+    uint32_t used_seconds, used_hours;
+    uint8_t day_percent, hour_percent;
     uint8_t progress_percent;
-    bool countdown_valid;
+    bool countdown_valid, hours_valid;
     Maintenance_status_t status;
 } Maintenance_item_para_t;
 
@@ -53,7 +57,8 @@ typedef struct
 {
     Maintenance_item_save_t machine, sensor;
     uint32_t saved_day;                /* 最近设置时的日期，用于校时检查 */
-    uint32_t sequence;                 /* 双备份记录的序号 */
+    uint32_t sequence;                 /* 循环记录的序号 */
+    uint32_t uptime_seconds;           /* 累计开机秒数，周期保存 */
 } Maintenance_save_t;
 
 /* 第二组：过程变量。主循环可读取显示字段；不要直接修改内部状态。
@@ -67,6 +72,10 @@ typedef struct
     Maintenance_status_t status;
     Maintenance_result_t last_result;
     uint32_t rtc_error_count;
+    uint32_t uptime_seconds, uptime_last_ms;
+    uint16_t uptime_remainder_ms;
+    bool uptime_loaded;
+    uint8_t loaded_version;
 
     /* Debugger command: set to true AFTER initialization to restart both items.
      * Defaults to false on every boot. Task consumes one request and records
@@ -108,7 +117,8 @@ void Maintenance_Task(void);
  * Preserves start_day; changing 180 -> 150 after 30 days leaves 120 days. */
 Maintenance_result_t Maintenance_SetPeriodDays(uint16_t days);
 
-/* Confirm completed maintenance and restart from today's screen RTC date.
+/* Confirm completed maintenance: restart the calendar from today's RTC date
+ * and restart this item's operating hours from the current uptime counter.
  * Also explicitly recovers corrupt records using the default period. */
 Maintenance_result_t Maintenance_Reset(void);
 
@@ -116,5 +126,8 @@ Maintenance_result_t Maintenance_Reset(void);
  * The original SetPeriodDays/Reset functions apply to the machine. */
 Maintenance_result_t Maintenance_SetSensorPeriodDays(uint16_t days);
 Maintenance_result_t Maintenance_ResetSensor(void);
+/* Hour limits: 1..65535, preserving the existing operating-time origin. */
+Maintenance_result_t Maintenance_SetPeriodHours(uint16_t hours);
+Maintenance_result_t Maintenance_SetSensorPeriodHours(uint16_t hours);
 
 #endif

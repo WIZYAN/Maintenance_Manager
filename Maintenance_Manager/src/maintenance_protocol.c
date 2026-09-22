@@ -86,14 +86,14 @@ static bool send_text(uint16_t control, const char *text)
     return Maintenance_PortSend(frame, (uint16_t) (length + 11U));
 }
 
-static void decimal(uint16_t number, char *text)
+static void decimal(uint32_t number, char *text)
 {
-    char reverse[5];
+    char reverse[10];
     uint8_t count = 0, index = 0;
     do
     {
         reverse[count++] = (char) ('0' + number % 10U);
-        number = (uint16_t) (number / 10U);
+        number /= 10U;
     } while (number != 0U);
     while (count != 0U) { text[index++] = reverse[--count]; }
     text[index] = '\0';
@@ -111,44 +111,78 @@ static bool send_progress(uint16_t control, uint8_t percent)
     return Maintenance_PortSend(frame, sizeof(frame));
 }
 
+static bool send_bar_color(uint16_t control, uint16_t rgb565)
+{
+    uint8_t frame[] = {0xEE,0xB1,0x19,0,0,0,0,0,0,0xFF,0xFC,0xFF,0xFF};
+    frame[3] = (uint8_t) (MAINTENANCE_SCREEN_ID >> 8);
+    frame[4] = (uint8_t) MAINTENANCE_SCREEN_ID;
+    frame[5] = (uint8_t) (control >> 8); frame[6] = (uint8_t) control;
+    frame[7] = (uint8_t) (rgb565 >> 8); frame[8] = (uint8_t) rgb565;
+    return Maintenance_PortSend(frame, sizeof(frame));
+}
+
+static const char *status_text(const Maintenance_item_para_t *para)
+{
+    /* GBK text, matching VisualTFT encode=1. */
+    if (para->progress_percent == 100U) { return "\xB9\xFD\xC6\xDA"; } /* overdue */
+    switch (para->status)
+    {
+        case MAINTENANCE_RUNNING: return "\xBD\xA1\xBF\xB5"; /* healthy */
+        case MAINTENANCE_RTC_FAULT: return "\xCA\xB1\xD6\xD3\xD2\xEC\xB3\xA3";
+        case MAINTENANCE_SAVE_FAULT: return "\xB4\xE6\xB4\xA2\xD2\xEC\xB3\xA3";
+        case MAINTENANCE_HARDWARE_FAULT: return "\xD3\xB2\xBC\xFE\xD2\xEC\xB3\xA3";
+        default: return "\xB5\xC8\xB4\xFD";
+    }
+}
+
 static void display_task(uint32_t now)
 {
-    static const uint16_t controls[6] = {
-        MAINTENANCE_MACHINE_PROGRESS_ID, MAINTENANCE_MACHINE_PERIOD_ID, MAINTENANCE_MACHINE_BAR_ID,
-        MAINTENANCE_SENSOR_PROGRESS_ID, MAINTENANCE_SENSOR_PERIOD_ID, MAINTENANCE_SENSOR_BAR_ID};
     const Maintenance_item_save_t *save;
     const Maintenance_item_para_t *para;
     uint8_t field = Maintenance_para.display_field;
-    char value[16];
+    bool sensor = field >= 6U;
+    uint16_t bar = sensor ? MAINTENANCE_SENSOR_BAR_ID : MAINTENANCE_MACHINE_BAR_ID;
+    char value[32], limit[12];
     bool sent;
     if (MAINTENANCE_SCREEN_ID == 0xFFFFU) { return; }
     if ((field == 0U) &&
         ((uint32_t) (now - Maintenance_para.display_ms) < MAINTENANCE_DISPLAY_PERIOD_MS)) { return; }
-    save = (field < 3U) ? &Maintenance_save.machine : &Maintenance_save.sensor;
-    para = (field < 3U) ? &Maintenance_para.machine : &Maintenance_para.sensor;
-    switch (field % 3U)
+    save = sensor ? &Maintenance_save.sensor : &Maintenance_save.machine;
+    para = sensor ? &Maintenance_para.sensor : &Maintenance_para.machine;
+    switch (field % 6U)
     {
         case 0:
-            if (para->countdown_valid)
-            {
-                uint16_t elapsed = (para->elapsed_days >= save->period_days) ?
-                    save->period_days : (uint16_t) para->elapsed_days;
-                decimal(elapsed, value);
-                strcat(value, "/");
-            }
-            else { strcpy(value, "--/"); }
-            sent = send_text(controls[field], value);
+            if (para->countdown_valid) { decimal(para->elapsed_days, value); }
+            else { strcpy(value, "--"); }
+            strcat(value, "\xCC\xEC/"); /* days, no cap */
+            sent = send_text(sensor ? MAINTENANCE_SENSOR_PROGRESS_ID : MAINTENANCE_MACHINE_PROGRESS_ID, value);
             break;
         case 1:
             if (Maintenance_para.record_valid) { decimal(save->period_days, value); }
             else { strcpy(value, "--"); }
-            sent = send_text(controls[field], value);
+            strcat(value, "\xCC\xEC");
+            sent = send_text(sensor ? MAINTENANCE_SENSOR_PERIOD_ID : MAINTENANCE_MACHINE_PERIOD_ID, value);
+            break;
+        case 2:
+            if (para->hours_valid) { decimal(para->used_hours, value); }
+            else { strcpy(value, "--"); }
+            strcat(value, "h/");
+            if (Maintenance_para.record_valid) { decimal(save->period_hours, limit); }
+            else { strcpy(limit, "--"); }
+            strcat(value, limit); strcat(value, "h");
+            sent = send_text(sensor ? MAINTENANCE_SENSOR_HOURS_ID : MAINTENANCE_MACHINE_HOURS_ID, value);
+            break;
+        case 3:
+            sent = send_text(sensor ? MAINTENANCE_SENSOR_STATUS_ID : MAINTENANCE_MACHINE_STATUS_ID, status_text(para));
+            break;
+        case 4:
+            sent = send_bar_color(bar, (para->progress_percent == 100U) ? MAINTENANCE_COLOR_DUE : MAINTENANCE_COLOR_NORMAL);
             break;
         default:
-            sent = send_progress(controls[field], para->countdown_valid ? para->progress_percent : 0U);
+            sent = send_progress(bar, para->progress_percent);
             break;
     }
-    if (sent && (++Maintenance_para.display_field >= 6U))
+    if (sent && (++Maintenance_para.display_field >= 12U))
     {
         Maintenance_para.display_field = 0;
         Maintenance_para.display_ms = now;
