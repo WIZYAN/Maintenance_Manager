@@ -1,0 +1,46 @@
+# Eclipse / e2 studio workspace state and local compiler discovery cache
+/.metadata/
+/Maintenance_Manager/.settings/language.settings.xml
+/Maintenance_Manager/*.jlink
+/Maintenance_Manager/*.jlinkscript.user
+
+# Firmware build output. Keep memory_regions.ld: the linker script and
+# tools/check_maintenance.py use this file to describe the target memory.
+/Maintenance_Manager/Debug/*
+!/Maintenance_Manager/Debug/memory_regions.ld
+/Maintenance_Manager/Release/*
+!/Maintenance_Manager/Release/memory_regions.ld
+
+# Intermediate objects and firmware images (including builds outside Debug)
+*.o
+*.obj
+*.d
+*.elf
+*.axf
+*.map
+*.lst
+*.su
+*.hex
+*.srec
+*.mot
+
+# Local test builds, PDF previews and downloaded reference copies
+/tmp/
+/tests/
+# Python / editor / operating-system caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.swp
+*.swo
+*~
+*.tmp
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Intentionally version: src/, ra/, ra_gen/, ra_cfg/, script/, configuration.xml,
+# .project, .cproject, shared .settings/*.prefs and *.launch configurations.
+# Also version VisualTFT projects, Lua scripts, images and font *.bin files.
+# Do not add a global *.bin exclusion: VisualTFT needs its binary font assets.
+/CVD01(Q2)-GC260801CN-V2.0B2.0.pdf
