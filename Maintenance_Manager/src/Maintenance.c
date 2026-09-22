@@ -208,6 +208,23 @@ Maintenance_result_t Maintenance_SetSensorPeriodDays(uint16_t days) { return set
 Maintenance_result_t Maintenance_Reset(void) { return reset_item(false); }
 Maintenance_result_t Maintenance_ResetSensor(void) { return reset_item(true); }
 
+static void service_reset_request(void)
+{
+    Maintenance_save_t candidate;
+    if (!Maintenance_para.reset_all_request) { return; }
+    /* Keep the request pending until a fresh RTC and storage are available.
+     * UpdateStatus has already checked RTC age in this iteration. */
+    if (!Maintenance_para.rtc_valid || !Maintenance_para.storage_loaded ||
+        Maintenance_para.storage_fault || Maintenance_para.migration_pending) { return; }
+    candidate = Maintenance_save;
+    candidate.machine.start_day = Maintenance_para.current_day;
+    candidate.sensor.start_day = Maintenance_para.current_day;
+    /* Commit both dates atomically, preserving the configured periods.
+     * Consume before I/O: an error requires a new explicit request. */
+    Maintenance_para.reset_all_request = false;
+    Maintenance_para.reset_all_result = commit(&candidate);
+}
+
 void Maintenance_Task(void)
 {
     uint32_t now;
@@ -217,6 +234,7 @@ void Maintenance_Task(void)
         memset(&Maintenance_save, 0, sizeof(Maintenance_save));
         Maintenance_save.machine.period_days = MAINTENANCE_DEFAULT_DAYS;
         Maintenance_save.sensor.period_days = MAINTENANCE_SENSOR_DEFAULT_DAYS;
+        Maintenance_para.reset_all_result = MAINTENANCE_NOT_READY;
         Maintenance_para.active_slot = -1;
         Maintenance_para.initialized = true;
         Maintenance_para.port_ready = Maintenance_PortInit();
@@ -243,4 +261,5 @@ void Maintenance_Task(void)
         candidate.sensor.start_day = Maintenance_para.current_day;
         (void) commit(&candidate);
     }
+    service_reset_request();
 }

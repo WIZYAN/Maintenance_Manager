@@ -68,6 +68,12 @@ typedef struct
     Maintenance_result_t last_result;
     uint32_t rtc_error_count;
 
+    /* Debugger command: set to true AFTER initialization to restart both items.
+     * Defaults to false on every boot. Task consumes one request and records
+     * the result; it never retries a failed write in a tight loop. */
+    volatile bool reset_all_request;
+    Maintenance_result_t reset_all_result;
+
     /* Internal task/storage/protocol state, also kept in this group. */
     bool initialized, port_ready, screen_ready, storage_loaded, storage_blank;
     bool storage_fault, storage_corrupt, rtc_pending, have_rtc;
