@@ -22,14 +22,12 @@ def main():
     parser.add_argument("--host-only", action="store_true")
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
-    # The white-box host test includes F_Maintenance.c; do not compile it twice.
-    core = [PROJECT / f for f in
-            ["Maintenance/A_Maintenance.c"]]
+    # 白盒测试包含 A/F 实现，用于检查私有状态；主机测试不重复编译它们。
     for display in [False, True]:
         binary = OUT / ("test-display.exe" if display else "test-core.exe")
         defines = [] if display else ["-DMAINTENANCE_SCREEN_ID=0xFFFF"]
         run([args.host_gcc, "-std=c99", "-Wall", "-Wextra", "-Werror", "-O2",
-             "-I", PROJECT, *defines, *core, ROOT / "tools/tests/test_maintenance.c", "-o", binary])
+             "-I", PROJECT, *defines, ROOT / "tools/tests/test_maintenance.c", "-o", binary])
         run([binary])
     if args.host_only:
         return

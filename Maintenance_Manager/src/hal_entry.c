@@ -11,11 +11,9 @@ FSP_CPP_FOOTER
  **********************************************************************************************************************/
 void hal_entry(void)
 {
-    static Maintenance_Context g_maintenance;
-
     while (1)
     {
-        A_Maintenance_Task(&g_maintenance);
+        A_Maintenance_Task();
         /* Add other non-blocking application tasks here. */
     }
 

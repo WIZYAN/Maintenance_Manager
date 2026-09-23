@@ -31,9 +31,9 @@
 ```text
 Maintenance_Manager/
 ├── src/
-│   └── hal_entry.c                   FSP 固定入口，持有上下文并调度 A 接口
+│   └── hal_entry.c                   FSP 固定入口，调度模块 A 接口
 └── Maintenance/
-    ├── A_Maintenance.c / .h          外部业务接口
+    ├── A_Maintenance.c / .h          外部业务接口，持有模块私有实例
     ├── F_Maintenance.c / .h          维保计算、协议、存储记录等模块功能
     ├── H_Maintenance.c / .h          RA UART、SysTick、GPIO、软件 I²C
     └── Maintenance_Config.h         配置宏
@@ -47,30 +47,28 @@ Maintenance_Manager/
 
 ## 调用接口
 
-主循环持续调用一个任务函数，工程已接入：
+接入方无需创建上下文或单独调用初始化函数。主循环持续调用无参数任务接口，工程已接入：
 
 ```c
 #include "Maintenance/A_Maintenance.h"
 
-static Maintenance_Context g_maintenance;  /* 零初始化，生命周期覆盖硬件运行期 */
-
 while (1)
 {
-    A_Maintenance_Task(&g_maintenance);
-    /* 其他非阻塞任务 */
+    A_Maintenance_Task();
+    // 其他非阻塞任务
 }
 ```
 
-以下为独立的操作示例，应在对应用户事件发生时调用，不要每个循环都执行：
+两项复位接口同样无参数，返回值用于确认保存结果；周期设置接口只需传入周期数值。以下操作应在对应用户事件发生时调用，不要每个循环都执行：
 
 ```c
-A_Maintenance_SetPeriodDays(&g_maintenance, 150);          // 整机日历周期：保留原起点
-A_Maintenance_SetSensorPeriodDays(&g_maintenance, 180);    // 传感器日历周期
-A_Maintenance_SetPeriodHours(&g_maintenance, 8000);        // 整机小时周期：保留已用时间
-A_Maintenance_SetSensorPeriodHours(&g_maintenance, 8000);  // 传感器小时周期
+A_Maintenance_SetPeriodDays(150);          // 整机日历周期：保留原起点
+A_Maintenance_SetSensorPeriodDays(180);    // 传感器日历周期
+A_Maintenance_SetPeriodHours(8000);        // 整机小时周期：保留已用时间
+A_Maintenance_SetSensorPeriodHours(8000);  // 传感器小时周期
 
-A_Maintenance_Reset(&g_maintenance);        // 整机：从今天、当前累计开机时间重新开始
-A_Maintenance_ResetSensor(&g_maintenance);  // 传感器：两项一起重新开始
+A_Maintenance_Reset();        // 整机：从今天、当前累计开机时间重新开始
+A_Maintenance_ResetSensor();  // 传感器：两项一起重新开始
 ```
 
 日历周期范围 1～36500 天，小时周期范围 1～65535 h。返回 `MAINTENANCE_OK` 才表示操作成功；实际保存的操作需完成 EEPROM 回读校验。重复设置相同周期不重复写入。
@@ -78,11 +76,11 @@ A_Maintenance_ResetSensor(&g_maintenance);  // 传感器：两项一起重新开
 
 ## 上下文结构体
 
-模块不再导出可写全局变量。调用方持有一个 `Maintenance_Context g_maintenance`，通过入口参数传递其地址；保存参数、运行状态、硬件状态分别归入 `save`、`state`、`port`。结构体类型采用首字母大写、下划线分词，结构体实例与指针采用 `g_` 加小写名称。读取显示结果前检查有效标志，不要绕过接口直接修改持久化参数。
+模块内部在 `A_Maintenance.c` 持有一个 `static Maintenance_Context g_maintenance`，所有 A 接口共用这一实例。接入方只调用接口，不需要创建、清零或传递上下文。模块不导出可写全局变量；F/H 层仍通过结构体指针传递状态，保留内部复用能力。
 
-上下文必须在首次调用前清零，所有操作传入同一个有效指针，运行期间不能清零、复制后切换或销毁它。RA 适配器仍独占一组 SCI9/SysTick 和 EEPROM；上下文传参不代表单板可同时运行多个硬件实例。中断因固定签名无法接收入口参数，硬件层保留一个文件内静态绑定结构体，由初始化时绑定 `port`。
+保存参数、运行状态、硬件状态分别归入 `save`、`state`、`port`。结构体类型采用首字母大写、下划线分词，实例与指针采用 `g_` 加小写名称。以下字段供模块维护和调试查看，业务代码不要绕过接口直接修改。
 
-实际工程的实例位于 `hal_entry()` 内，具有静态存储期和局部可见性；新增应用模块应通过参数接收它的地址。
+当前硬件适配器独占一组 SCI9/SysTick 和 EEPROM。移植到其他项目时，将 `Maintenance/` 加入源文件构建并配置头文件搜索路径；按目标硬件调整 H 层的引脚、串口及中断配置，保留 1 毫秒时基，避免重复定义 `SysTick_Handler` 或 `DIS_Callback`。A/F 层接口和维保逻辑无需因接入方改变。首次任务会等待屏幕启动和有效 RTC，复位的时间及存储前置条件保持原样。
 
 | 变量 | 主要字段 | 含义 |
 |---|---|---|
@@ -104,7 +102,7 @@ A_Maintenance_ResetSensor(&g_maintenance);  // 传感器：两项一起重新开
 ### 调试时一次性重置两项目
 
 1. 编译并下载新固件，运行到 RTC 正常，确认屏幕日期正确。
-2. 暂停并选中 `hal_entry` 调用栈帧，在 e² studio 的 Expressions 中将 `g_maintenance.state.reset_all_request` 改为 `1`。
+2. 暂停并选中 `A_Maintenance_Task` 调用栈帧，在 e² studio 的 Expressions 中将 `g_maintenance.state.reset_all_request` 改为 `1`；该变量现在是 `A_Maintenance.c` 内的静态实例。
 3. 恢复运行。主循环等待有效 RTC 和可用存储，用一次提交保存两项目的新起点。
 4. 请求自动变为 `0`，`reset_all_result == MAINTENANCE_OK`（0）表示成功。两项目均显示 `0天/周期天`、`0h/周期h`。
 
@@ -178,7 +176,7 @@ MCU 工程：在 e² studio 中打开 `Maintenance_Manager` 并编译。命令�
 python tools/check_maintenance.py
 ```
 
-脚本先运行主机测试，再用本机 ARM GCC 编译、链接，输出到 `tmp/maintenance-build`；可传 `--host-only`、`--arm-gcc`、`--host-gcc`。回归测试随源码保存在 `tools/tests/`；根目录被忽略的 `tests/` 是原本的本地副本，不参与构建。测试通过包含功能层实现检查私有日期/RTC 辅助函数，不为测试增加生产导出接口。
+脚本先运行主机测试，再用本机 ARM GCC 编译、链接，输出到 `tmp/maintenance-build`；可传 `--host-only`、`--arm-gcc`、`--host-gcc`。回归测试随源码保存在 `tools/tests/`；根目录被忽略的 `tests/` 是原本的本地副本，不参与构建。测试通过包含 A/F 层实现检查私有实例和日期/RTC 辅助函数，不为测试增加生产导出接口。
 
 屏幕工程：使用 VisualTFT 打开 `VisualTFT/Project/Project.tftprj` 编译并下载。生成资源在 `VisualTFT/Project/output`，该目录忽略版本管理，源码和字体资源保留。
 
