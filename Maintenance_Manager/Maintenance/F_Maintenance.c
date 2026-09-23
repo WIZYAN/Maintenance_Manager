@@ -2,7 +2,7 @@
 #include <stddef.h>
 #include <string.h>
 
-// 下列为本文件内部辅助函数声明；跨文件的三个功能层入口在头文件声明。
+// 下列为本文件内部辅助函数声明；跨文件的功能层入口在头文件声明。
 static bool F_Maintenance_DateToDay(const Maintenance_Date *g_date, uint32_t *day);
 static void F_Maintenance_RejectRtc(Maintenance_Context *g_context);
 static void F_Maintenance_AcceptRtc(Maintenance_Context *g_context, const Maintenance_Date *g_date, uint32_t now);
@@ -34,6 +34,8 @@ static bool F_Maintenance_SendBarColor(Maintenance_Context *g_context, uint16_t 
 static const char *F_Maintenance_StatusText(const Maintenance_Item_State *g_para);
 static void F_Maintenance_DisplayTask(Maintenance_Context *g_context, uint32_t now);
 static void F_Maintenance_ProtocolTask(Maintenance_Context *g_context, uint32_t now);
+static void F_Maintenance_CalibrationTask(Maintenance_Context *g_context, uint32_t now);
+static void F_Maintenance_CalibrationInput(Maintenance_Context *g_context);
 
 /*
  * 函数名：F_Maintenance_DateToDay
@@ -86,7 +88,7 @@ static void F_Maintenance_RejectRtc(Maintenance_Context *g_context)
 
 /*
  * 函数名：F_Maintenance_AcceptRtc
- * 说明：校验并接收 RTC 日期，拒绝早于本次已见日期或已保存日期的回退
+ * 说明：接收 RTC 秒数，正常走时累计差值，受控校时仅累计操作期间实际经过的时间
  * 输入：g_context：非空维保上下文指针，首次任务调用前清零，运行期间地址保持有效
  *       g_date：解析出的 RTC 日期时间
  *       now：本次调度的毫秒计数，允许无符号回绕
@@ -95,21 +97,56 @@ static void F_Maintenance_RejectRtc(Maintenance_Context *g_context)
  */
 static void F_Maintenance_AcceptRtc(Maintenance_Context *g_context, const Maintenance_Date *g_date, uint32_t now)
 {
-    uint32_t day;
-    if (!F_Maintenance_DateToDay(g_date, &day) ||
-        (g_context->state.have_rtc && (day < g_context->state.highest_day)) ||
-        (g_context->state.record_valid && (day < g_context->save.saved_day)))
+    uint32_t day, seconds;
+    Maintenance_State *g_state = &g_context->state;
+    if (!F_Maintenance_DateToDay(g_date, &day)) { F_Maintenance_RejectRtc(g_context); return; }
+    seconds = day * 86400U + (uint32_t) g_date->hour * 3600U + (uint32_t) g_date->minute * 60U + g_date->second;
+    if (g_state->calibration_phase == 1U) { return; } // 已保存校时意图后不再接受旧查询的回包。
+    if (g_state->calibration_phase == 2U)
     {
-        F_Maintenance_RejectRtc(g_context);
-        return;
+        uint32_t passed = (now - g_state->calibration_sent_ms) / 1000U;
+        uint32_t expected = F_Maintenance_SaturatingAdd(g_context->save.rtc_target_seconds, passed);
+        uint32_t difference = (seconds >= expected) ? seconds - expected : expected - seconds;
+        uint32_t delta = now - g_state->calibration_base_ms;
+        uint32_t fraction = delta % 1000U + g_state->calibration_remainder_ms;
+        if (difference > 2U) { return; } // 忽略校时前滞留回包，目标回读超时由任务统一处理。
+        g_state->calendar_seconds = F_Maintenance_SaturatingAdd(g_state->calibration_base_seconds,
+            delta / 1000U + fraction / 1000U);
+        g_state->calibration_remainder_ms = (uint16_t) (fraction % 1000U);
+        g_state->calendar_ready = true;
+        g_state->calibration_phase = 3U; // RTC 已确认，只有新锚点成功落盘后才报告校时成功。
     }
-    g_context->state.rtc = *g_date;
-    g_context->state.current_day = day;
-    g_context->state.highest_day = day;
-    g_context->state.have_rtc = true;
-    g_context->state.rtc_valid = true;
-    g_context->state.rtc_pending = false;
-    g_context->state.last_rtc_ms = now;
+    else if (g_context->save.calibration_pending)
+    {
+        g_state->calendar_ready = false; // 校时中断后无法区分断电前后的时域，不猜测断电时长。
+        g_state->calendar_seconds = g_context->save.calendar_seconds;
+    }
+    else if (g_state->calendar_ready && !g_state->migration_pending)
+    {
+        if (seconds < g_state->rtc_seconds) { F_Maintenance_RejectRtc(g_context); return; }
+        g_state->calendar_seconds = F_Maintenance_SaturatingAdd(g_state->calendar_seconds, seconds - g_state->rtc_seconds);
+    }
+    else if (g_state->record_valid && !g_state->migration_pending)
+    {
+        if (seconds < g_context->save.rtc_anchor_seconds) { F_Maintenance_RejectRtc(g_context); return; }
+        g_state->calendar_seconds = F_Maintenance_SaturatingAdd(g_context->save.calendar_seconds,
+            seconds - g_context->save.rtc_anchor_seconds); // 普通重启使用成对锚点补计断电期间实际经过的秒数。
+        g_state->calendar_ready = true;
+    }
+    else
+    {
+        if (g_state->migration_pending && (day < g_context->save.rtc_anchor_seconds))
+        { F_Maintenance_RejectRtc(g_context); return; }
+        g_state->calendar_seconds = seconds;
+        g_state->calendar_ready = true;
+    }
+    g_state->rtc = *g_date;
+    g_state->current_day = day;
+    g_state->rtc_seconds = seconds;
+    g_state->have_rtc = true;
+    g_state->rtc_valid = true;
+    g_state->rtc_pending = false;
+    g_state->last_rtc_ms = now;
 }
 
 /*
@@ -171,22 +208,23 @@ static void F_Maintenance_UpdateHours(Maintenance_Context *g_context, const Main
 
 /*
  * 函数名：F_Maintenance_UpdateItem
- * 说明：计算单项目日历进度，并取日历与开机时间进度中的较大值
+ * 说明：按累计秒数计算单项目日历进度，并取日历与开机时间进度中的较大值
  * 输入：g_context：非空维保上下文指针，首次任务调用前清零，运行期间地址保持有效
  *       g_save：该项目已保存的日历周期与起点
  *       g_para：已计算小时进度的项目运行状态
- * 输出：无返回值；g_para：更新到期日、已过与剩余天数、总进度和项目状态
- * 使用：仅在本 .c 文件内部调用，仅在日期和记录有效且当前日期不早于保存水位时调用
+ * 输出：无返回值；g_para：更新累计时间轴到期日序号、已过与剩余天数、总进度和项目状态
+ * 使用：仅在本 .c 文件内部调用，仅在累计时间和记录有效且无待确认校时事务时调用
  */
 static void F_Maintenance_UpdateItem(Maintenance_Context *g_context, const Maintenance_Item_Save *g_save, Maintenance_Item_State *g_para)
 {
-    g_para->due_day = g_save->start_day + g_save->period_days;
-    g_para->elapsed_days = g_context->state.current_day - g_save->start_day;
-    g_para->remaining_days = (g_context->state.current_day >= g_para->due_day) ?
-        0U : (uint16_t) (g_para->due_day - g_context->state.current_day);
-    g_para->day_percent = (g_para->elapsed_days >= g_save->period_days) ? 100U :
-        (uint8_t) ((g_para->elapsed_days * 100U) / g_save->period_days);
-    g_para->progress_percent = (g_para->day_percent > g_para->hour_percent) ? g_para->day_percent : g_para->hour_percent; // 两项进度取较大值，任一周期到期即可触发保养提示。
+    uint32_t elapsed = g_context->state.calendar_seconds - g_save->start_calendar_seconds;
+    uint32_t limit = (uint32_t) g_save->period_days * 86400U;
+    g_para->due_day = g_save->start_calendar_seconds / 86400U + g_save->period_days; // 累计时间轴上的日序号，不再表示屏幕上的公历到期日期。
+    g_para->elapsed_days = elapsed / 86400U; // 满 24 小时才增加一天，跨午夜不足 24 小时仍为零天。
+    g_para->remaining_days = (g_para->elapsed_days >= g_save->period_days) ? 0U :
+        (uint16_t) (g_save->period_days - g_para->elapsed_days);
+    g_para->day_percent = (elapsed >= limit) ? 100U : (uint8_t) (((uint64_t) elapsed * 100U) / limit);
+    g_para->progress_percent = (g_para->day_percent > g_para->hour_percent) ? g_para->day_percent : g_para->hour_percent;
     g_para->countdown_valid = true;
     g_para->status = (g_para->progress_percent == 100U) ? MAINTENANCE_DUE : MAINTENANCE_RUNNING;
 }
@@ -225,9 +263,10 @@ static void F_Maintenance_UpdateStatus(Maintenance_Context *g_context, uint32_t 
     {
         g_context->state.status = MAINTENANCE_WAITING;
     }
-    else if (g_context->state.current_day < g_context->save.saved_day)
+    else if (!g_context->state.calendar_ready || g_context->save.calibration_pending ||
+             (g_context->state.calendar_seconds < g_context->save.machine.start_calendar_seconds) ||
+             (g_context->state.calendar_seconds < g_context->save.sensor.start_calendar_seconds))
     {
-        g_context->state.rtc_valid = false;
         g_context->state.status = MAINTENANCE_RTC_FAULT;
     }
     else
@@ -263,15 +302,16 @@ static Maintenance_Result F_Maintenance_TimeReady(Maintenance_Context *g_context
         g_context->state.rtc_valid = false;
     }
     F_Maintenance_UpdateStatus(g_context, now);
-    return g_context->state.rtc_valid ? MAINTENANCE_OK : MAINTENANCE_TIME_ERROR;
+    if (g_context->save.calibration_pending || (g_context->state.calibration_phase != 0U)) { return MAINTENANCE_NOT_READY; }
+    return g_context->state.rtc_valid && g_context->state.calendar_ready ? MAINTENANCE_OK : MAINTENANCE_TIME_ERROR;
 }
 
 /*
  * 函数名：F_Maintenance_Commit
- * 说明：补齐候选记录的开机时间和日期水位，写入 EEPROM 并更新运行状态
+ * 说明：补齐候选记录的开机时间及成对的 RTC 和累计时间锚点，写入 EEPROM 并更新运行状态
  * 输入：g_context：非空维保上下文指针，首次任务调用前清零，运行期间地址保持有效
  *       g_candidate：准备保存的候选记录指针
- * 输出：返回 MAINTENANCE_OK 或 MAINTENANCE_STORAGE_ERROR；g_candidate：更新累计秒数、日期水位及成功提交的序号
+ * 输出：返回 MAINTENANCE_OK 或 MAINTENANCE_STORAGE_ERROR；g_candidate：更新累计秒数、配对锚点及成功提交的序号
  *       g_context：成功时采用新记录并触发显示刷新，失败时标记存储故障
  * 使用：仅在本 .c 文件内部调用，用于周期修改、复位、记录初始化、迁移和分钟保存
  */
@@ -279,8 +319,11 @@ static Maintenance_Result F_Maintenance_Commit(Maintenance_Context *g_context, M
 {
     g_candidate->uptime_seconds = g_context->state.uptime_seconds;
 
-    if (g_context->state.rtc_valid && (g_context->state.current_day >= g_candidate->saved_day))
-    { g_candidate->saved_day = g_context->state.current_day; } // RTC 异常时保留上次有效日期，仍可保存开机时间。
+    if (g_context->state.rtc_valid && g_context->state.calendar_ready && (g_context->state.calibration_phase != 2U))
+    {
+        g_candidate->rtc_anchor_seconds = g_context->state.rtc_seconds;
+        g_candidate->calendar_seconds = g_context->state.calendar_seconds;
+    } // 原始 RTC 和累计秒数必须成对保存；RTC 异常时只更新开机小时计数。
     if (!F_Maintenance_StorageCommit(g_context, g_candidate))
     {
         g_context->state.storage_fault = true;
@@ -291,7 +334,7 @@ static Maintenance_Result F_Maintenance_Commit(Maintenance_Context *g_context, M
         g_context->save = *g_candidate;
         g_context->state.record_valid = true;
         g_context->state.uptime_loaded = true;
-        g_context->state.loaded_version = 3U;
+        g_context->state.loaded_version = 4U;
         g_context->state.storage_loaded = true;
         g_context->state.storage_blank = false;
         g_context->state.storage_fault = false;
@@ -365,15 +408,15 @@ Maintenance_Result F_Maintenance_ResetItem(Maintenance_Context *g_context, bool 
 
             if (!g_context->state.record_valid)
             {
-                g_candidate.machine.start_day = g_context->state.current_day;
-                g_candidate.sensor.start_day = g_context->state.current_day;
+                g_candidate.machine.start_calendar_seconds = g_context->state.calendar_seconds;
+                g_candidate.sensor.start_calendar_seconds = g_context->state.calendar_seconds;
                 g_candidate.machine.start_uptime_seconds = g_context->state.uptime_seconds;
                 g_candidate.sensor.start_uptime_seconds = g_context->state.uptime_seconds; // 无有效记录时同时重建两个项目的起点。
             }
             else
             {
                 Maintenance_Item_Save *g_item = sensor ? &g_candidate.sensor : &g_candidate.machine;
-                g_item->start_day = g_context->state.current_day;
+                g_item->start_calendar_seconds = g_context->state.calendar_seconds;
                 g_item->start_uptime_seconds = g_context->state.uptime_seconds;
             }
             return F_Maintenance_Commit(g_context, &g_candidate);
@@ -396,10 +439,11 @@ static void F_Maintenance_ServiceResetRequest(Maintenance_Context *g_context)
     if (!g_context->state.reset_all_request) { return; }
 
     if (!g_context->state.rtc_valid || !g_context->state.storage_loaded ||
-        g_context->state.storage_fault || g_context->state.migration_pending) { return; } // 本轮已检查 RTC 新鲜度；条件不足时保留调试请求，暂不复位。
+        g_context->state.storage_fault || g_context->state.migration_pending ||
+        !g_context->state.calendar_ready || g_context->save.calibration_pending) { return; } // 本轮已检查 RTC 新鲜度；条件不足时保留调试请求，暂不复位。
     g_candidate = g_context->save;
-    g_candidate.machine.start_day = g_context->state.current_day;
-    g_candidate.sensor.start_day = g_context->state.current_day;
+    g_candidate.machine.start_calendar_seconds = g_context->state.calendar_seconds;
+    g_candidate.sensor.start_calendar_seconds = g_context->state.calendar_seconds;
     g_candidate.machine.start_uptime_seconds = g_context->state.uptime_seconds;
     g_candidate.sensor.start_uptime_seconds = g_context->state.uptime_seconds;
 
@@ -427,6 +471,7 @@ void F_Maintenance_Task(Maintenance_Context *g_context)
         g_context->save.machine.period_hours = MAINTENANCE_DEFAULT_HOURS;
         g_context->save.sensor.period_hours = MAINTENANCE_SENSOR_DEFAULT_HOURS;
         g_context->state.reset_all_result = MAINTENANCE_NOT_READY;
+        g_context->state.calibration_result = MAINTENANCE_NOT_READY;
         g_context->state.active_slot = -1;
         g_context->state.initialized = true;
         g_context->state.port_ready = H_Maintenance_PortInit(&g_context->port);
@@ -446,6 +491,8 @@ void F_Maintenance_Task(Maintenance_Context *g_context)
         {
             if (!g_context->state.uptime_loaded)
             {
+                g_context->state.calendar_ready = false;
+                g_context->state.rtc_valid = false;
                 g_context->state.uptime_seconds = F_Maintenance_SaturatingAdd(g_context->save.uptime_seconds,
                     g_context->state.uptime_seconds);
                 g_context->state.uptime_loaded = true;
@@ -461,14 +508,26 @@ void F_Maintenance_Task(Maintenance_Context *g_context)
         ((uint32_t) (now - g_context->state.last_rtc_ms) <= MAINTENANCE_RTC_FRESH_MS))
     {
         Maintenance_Save g_candidate = g_context->save;
-        if (!g_context->state.migration_pending) { g_candidate.machine.start_day = g_context->state.current_day; }
-        if (!g_context->state.migration_pending || (g_candidate.sensor.start_day == UINT32_MAX))
-        { g_candidate.sensor.start_day = g_context->state.current_day; }
+        if (g_context->state.migration_pending)
+        {
+            g_candidate.machine.start_calendar_seconds = g_context->state.calendar_seconds -
+                (g_context->state.current_day - g_candidate.machine.start_calendar_seconds) * 86400U;
+            g_candidate.sensor.start_calendar_seconds = (g_candidate.sensor.start_calendar_seconds == UINT32_MAX) ?
+                g_context->state.calendar_seconds : g_context->state.calendar_seconds -
+                (g_context->state.current_day - g_candidate.sensor.start_calendar_seconds) * 86400U;
+        } // 旧记录仅有日期，保留原有整天数；升级后才精确累计不足一天的部分。
+        else
+        {
+            g_candidate.machine.start_calendar_seconds = g_context->state.calendar_seconds;
+            g_candidate.sensor.start_calendar_seconds = g_context->state.calendar_seconds;
+        }
         (void) F_Maintenance_Commit(g_context, &g_candidate);
     }
+    F_Maintenance_CalibrationTask(g_context, H_Maintenance_PortNow(&g_context->port));
     F_Maintenance_ServiceResetRequest(g_context);
     if (g_context->state.record_valid && g_context->state.uptime_loaded && !g_context->state.migration_pending &&
         !g_context->state.storage_fault && !g_context->state.storage_corrupt &&
+        (g_context->state.calibration_phase == 0U) &&
         (g_context->state.uptime_seconds - g_context->save.uptime_seconds >= MAINTENANCE_SAVE_INTERVAL_SECONDS))
     {
         Maintenance_Save g_candidate = g_context->save;
@@ -484,8 +543,10 @@ void F_Maintenance_Task(Maintenance_Context *g_context)
 // v1 的 22～27 保留为零，等待有效 RTC 后迁移传感器起点。
 // v3 保留前 28 字节布局，28 为累计开机秒数，32/36 为两项目开机秒数起点；
 // 40/42 为两项目小时周期，44 为前 44 字节的 CRC32；提交标记位置不变。
+// v4 的 12/22 改为累计日历秒数起点，16 为原始 RTC 秒数锚点；
+// 44 为累计日历秒数，48 为校时目标，52 为待确认标志，53～55 保留为零，56 为前 56 字节 CRC32。
 // 逻辑槽 0/1 保留旧地址映射，兼容历史记录。
-#define RECORD_SIZE 48U
+#define RECORD_SIZE 60U
 #define COMMIT_OFFSET 63U
 #define COMMIT_MARKER 0xA5U
 
@@ -601,7 +662,7 @@ static bool F_Maintenance_Erased(const uint8_t *page)
 
 /*
  * 函数名：F_Maintenance_Decode
- * 说明：校验提交标记、版本、长度、CRC 和参数范围，解析 v1/v2/v3 记录
+ * 说明：校验提交标记、版本、长度、CRC 和参数范围，解析 v1/v2/v3/v4 记录
  * 输入：page：包含整页数据的可读缓冲区
  *       g_save：解码结果缓冲区
  * 输出：返回 true 表示有效记录，false 表示校验失败；g_save：有效时写入记录，失败时可能已被部分修改，不可使用
@@ -610,16 +671,18 @@ static bool F_Maintenance_Erased(const uint8_t *page)
 static bool F_Maintenance_Decode(const uint8_t *page, Maintenance_Save *g_save)
 {
     uint8_t i;
-    uint16_t length = (page[4] == 3U) ? RECORD_SIZE : 32U;
+    uint16_t length = (page[4] == 4U) ? RECORD_SIZE : ((page[4] == 3U) ? 48U : 32U);
+    uint32_t ceiling;
+    memset(g_save, 0, sizeof(*g_save));
     if ((page[COMMIT_OFFSET] != COMMIT_MARKER) || (memcmp(page, "MNT1", 4) != 0) ||
-        (page[4] < 1U) || (page[4] > 3U) || (page[5] != 0U) || (F_Maintenance_Get16(page + 6) != length) ||
+        (page[4] < 1U) || (page[4] > 4U) || (page[5] != 0U) || (F_Maintenance_Get16(page + 6) != length) ||
         (F_Maintenance_Get32(page + length - 4U) != F_Maintenance_Crc32(page, (uint16_t) (length - 4U)))) { return false; }
     g_save->uptime_seconds = 0;
     g_save->machine.start_uptime_seconds = 0;
     g_save->sensor.start_uptime_seconds = 0;
     g_save->machine.period_hours = MAINTENANCE_DEFAULT_HOURS;
     g_save->sensor.period_hours = MAINTENANCE_SENSOR_DEFAULT_HOURS;
-    if (page[4] == 3U)
+    if (page[4] >= 3U)
     {
         g_save->uptime_seconds = F_Maintenance_Get32(page + 28);
         g_save->machine.start_uptime_seconds = F_Maintenance_Get32(page + 32);
@@ -630,25 +693,37 @@ static bool F_Maintenance_Decode(const uint8_t *page, Maintenance_Save *g_save)
             (g_save->sensor.start_uptime_seconds > g_save->uptime_seconds) ||
             (g_save->machine.period_hours == 0U) || (g_save->sensor.period_hours == 0U)) { return false; }
     }
+    ceiling = F_Maintenance_Get32(page + 16);
+    if (page[4] == 4U)
+    {
+        g_save->calendar_seconds = F_Maintenance_Get32(page + 44);
+        g_save->rtc_target_seconds = F_Maintenance_Get32(page + 48);
+        g_save->calibration_pending = page[52] != 0U;
+        if ((page[52] > 1U) || (page[53] != 0U) || (page[54] != 0U) || (page[55] != 0U) ||
+            (ceiling >= 3155760000UL) || (g_save->rtc_target_seconds >= 3155760000UL) ||
+            (!g_save->calibration_pending && (g_save->rtc_target_seconds != 0U))) { return false; }
+        ceiling = g_save->calendar_seconds;
+    }
+    else if (ceiling >= 36525U) { return false; }
     if (page[4] == 1U)
     {
         for (i = 22U; i < 28U; ++i) { if (page[i] != 0U) { return false; } }
-        g_save->sensor.start_day = UINT32_MAX;
+        g_save->sensor.start_calendar_seconds = UINT32_MAX;
         g_save->sensor.period_days = MAINTENANCE_SENSOR_DEFAULT_DAYS;
     }
     else
     {
-        g_save->sensor.start_day = F_Maintenance_Get32(&page[22]);
+        g_save->sensor.start_calendar_seconds = F_Maintenance_Get32(&page[22]);
         g_save->sensor.period_days = (uint16_t) ((uint16_t) page[26] | ((uint16_t) page[27] << 8));
         if ((g_save->sensor.period_days == 0U) || (g_save->sensor.period_days > MAINTENANCE_MAX_DAYS) ||
-            (g_save->sensor.start_day > F_Maintenance_Get32(&page[16]))) { return false; }
+            (g_save->sensor.start_calendar_seconds > ceiling)) { return false; }
     }
     g_save->sequence = F_Maintenance_Get32(&page[8]);
-    g_save->machine.start_day = F_Maintenance_Get32(&page[12]);
-    g_save->saved_day = F_Maintenance_Get32(&page[16]);
+    g_save->machine.start_calendar_seconds = F_Maintenance_Get32(&page[12]);
+    g_save->rtc_anchor_seconds = F_Maintenance_Get32(&page[16]);
     g_save->machine.period_days = (uint16_t) ((uint16_t) page[20] | ((uint16_t) page[21] << 8));
     return (g_save->machine.period_days > 0U) && (g_save->machine.period_days <= MAINTENANCE_MAX_DAYS) &&
-           (g_save->machine.start_day <= g_save->saved_day) && (g_save->saved_day < 36525U);
+           (g_save->machine.start_calendar_seconds <= ceiling);
 }
 
 /*
@@ -696,7 +771,13 @@ static bool F_Maintenance_StorageLoad(Maintenance_Context *g_context)
     if (best_slot >= 0)
     {
         g_context->save = g_best;
-        g_context->state.migration_pending = (version < 3U);
+        if (g_best.calibration_pending && (g_context->state.calibration_phase == 0U))
+        {
+            g_context->state.calendar_ready = false;
+            g_context->state.calibration_result = MAINTENANCE_TIME_ERROR;
+            g_context->state.calibration_notice = true;
+        }
+        g_context->state.migration_pending = (version < 4U);
         g_context->state.record_valid = true;
         g_context->state.last_result = MAINTENANCE_OK;
         return true;
@@ -721,7 +802,7 @@ static bool F_Maintenance_StorageLoad(Maintenance_Context *g_context)
  * 函数名：F_Maintenance_StorageCommit
  * 说明：将候选记录写入下一日志页，按失效、写入校验、提交校验的顺序保存
  * 输入：g_context：非空维保上下文指针，首次任务调用前清零，运行期间地址保持有效
- *       g_candidate：准备写入的 v3 参数记录，累计时间和日期水位已补齐
+ *       g_candidate：准备写入的 v4 参数记录，累计时间和配对锚点已补齐
  * 输出：返回 true 表示最终回读校验成功，false 表示写入或校验失败
  *       g_candidate：成功时更新序号；g_context：成功时更新活动槽，失败时 EEPROM 可能已有完整新记录
  * 使用：仅在本 .c 文件内部调用，由统一保存流程调用，不覆盖当前有效页
@@ -737,14 +818,14 @@ static bool F_Maintenance_StorageCommit(Maintenance_Context *g_context, Maintena
     uint16_t address = F_Maintenance_SlotAddress((uint8_t) next_slot); // 选择下一页写入，保留当前有效页作为掉电恢复依据。
     uint32_t sequence = g_context->state.record_valid ? g_context->save.sequence + 1U : 1U;
     memcpy(g_record, "MNT1", 4);
-    g_record[4] = 3U;
+    g_record[4] = 4U;
     g_record[6] = RECORD_SIZE;
     F_Maintenance_Put32(&g_record[8], sequence);
-    F_Maintenance_Put32(&g_record[12], g_candidate->machine.start_day);
-    F_Maintenance_Put32(&g_record[16], g_candidate->saved_day);
+    F_Maintenance_Put32(&g_record[12], g_candidate->machine.start_calendar_seconds);
+    F_Maintenance_Put32(&g_record[16], g_candidate->rtc_anchor_seconds);
     g_record[20] = (uint8_t) g_candidate->machine.period_days;
     g_record[21] = (uint8_t) (g_candidate->machine.period_days >> 8);
-    F_Maintenance_Put32(&g_record[22], g_candidate->sensor.start_day);
+    F_Maintenance_Put32(&g_record[22], g_candidate->sensor.start_calendar_seconds);
     g_record[26] = (uint8_t) g_candidate->sensor.period_days;
     g_record[27] = (uint8_t) (g_candidate->sensor.period_days >> 8);
     F_Maintenance_Put32(g_record + 28, g_candidate->uptime_seconds);
@@ -752,7 +833,10 @@ static bool F_Maintenance_StorageCommit(Maintenance_Context *g_context, Maintena
     F_Maintenance_Put32(g_record + 36, g_candidate->sensor.start_uptime_seconds);
     F_Maintenance_Put16(g_record + 40, g_candidate->machine.period_hours);
     F_Maintenance_Put16(g_record + 42, g_candidate->sensor.period_hours);
-    F_Maintenance_Put32(g_record + 44, F_Maintenance_Crc32(g_record, 44U));
+    F_Maintenance_Put32(g_record + 44, g_candidate->calendar_seconds);
+    F_Maintenance_Put32(g_record + 48, g_candidate->rtc_target_seconds);
+    g_record[52] = g_candidate->calibration_pending ? 1U : 0U;
+    F_Maintenance_Put32(g_record + 56, F_Maintenance_Crc32(g_record, 56U));
 
     if (!H_Maintenance_EepromWrite((uint16_t) (address + COMMIT_OFFSET), &marker, 1U) ||
         !H_Maintenance_EepromRead((uint16_t) (address + COMMIT_OFFSET), &read_marker, 1U) ||
@@ -791,10 +875,10 @@ static bool F_Maintenance_Bcd(uint8_t raw, uint8_t *value)
 
 /*
  * 函数名：F_Maintenance_ReceiveFrame
- * 说明：处理组帧完成的 RTC 回包，校验长度、BCD 和星期后提交日期
+ * 说明：处理完整 RTC 回包或校时文本通知，校验字段后提交时间
  * 输入：g_context：非空维保上下文指针，首次任务调用前清零，运行期间地址保持有效
  *       now：本次调度的毫秒计数，允许无符号回绕
- * 输出：无返回值；g_context：更新 RTC 数据或错误状态，非 RTC 帧及无待处理请求的帧被忽略
+ * 输出：无返回值；g_context：更新 RTC 数据或错误状态，其他帧及无待处理查询的 RTC 帧被忽略
  * 使用：仅在本 .c 文件内部调用，接收缓冲区已匹配帧尾后调用
  */
 static void F_Maintenance_ReceiveFrame(Maintenance_Context *g_context, uint32_t now)
@@ -802,6 +886,11 @@ static void F_Maintenance_ReceiveFrame(Maintenance_Context *g_context, uint32_t 
     const uint8_t *f = g_context->state.frame;
     Maintenance_Date g_date;
     uint8_t year, week;
+    if ((g_context->state.frame_length >= 8U) && (f[1] == 0xB1U) && (f[2] == 0x11U))
+    {
+        F_Maintenance_CalibrationInput(g_context);
+        return;
+    }
     if ((g_context->state.frame_length < 2U) || (f[1] != 0xF7U) ||
         !g_context->state.rtc_pending) { return; }
     if ((g_context->state.frame_length != 13U) ||
@@ -1052,6 +1141,7 @@ static void F_Maintenance_ProtocolTask(Maintenance_Context *g_context, uint32_t 
         if ((uint32_t) (now - g_context->state.started_ms) < MAINTENANCE_SCREEN_BOOT_MS) { return; }
         g_context->state.screen_ready = true;
     }
+    if ((g_context->state.calibration_phase == 1U) || (g_context->state.calibration_phase == 3U)) { return; }
     if (!g_context->state.rtc_pending &&
         ((uint32_t) (now - g_context->state.last_rtc_request_ms) >= MAINTENANCE_RTC_POLL_MS))
     {
@@ -1063,4 +1153,149 @@ static void F_Maintenance_ProtocolTask(Maintenance_Context *g_context, uint32_t 
         return;
     }
     F_Maintenance_DisplayTask(g_context, now);
+}
+
+/*
+ * 函数名：F_Maintenance_SetRtc
+ * 说明：保存校时事务并发起异步 RTC 校准，保留两个保养项目已累计的时间
+ * 输入：g_context：非空模块上下文；g_date：2000～2099 年的合法目标日期时间
+ * 输出：返回 MAINTENANCE_IN_PROGRESS 表示已受理，其他值表示参数、时间、就绪或存储错误；g_context：更新校时状态
+ * 使用：供 A_Maintenance.c 跨文件调用，或本文件处理屏幕输入；主循环继续调度直到查询结果结束，校时过程中禁止复位或修改周期
+ */
+Maintenance_Result F_Maintenance_SetRtc(Maintenance_Context *g_context, const Maintenance_Date *g_date)
+{
+    Maintenance_Save g_candidate;
+    Maintenance_State *g_state = &g_context->state;
+    uint32_t day, now = H_Maintenance_PortNow(&g_context->port);
+    Maintenance_Result result;
+    if (!F_Maintenance_DateToDay(g_date, &day)) { return MAINTENANCE_INVALID_ARGUMENT; }
+    if (!g_state->initialized || !g_state->port_ready || !g_state->record_valid ||
+        g_state->migration_pending || (g_state->calibration_phase != 0U)) { return MAINTENANCE_NOT_READY; }
+    if (g_state->storage_fault || g_state->storage_corrupt) { return MAINTENANCE_STORAGE_ERROR; }
+    if (!g_state->rtc_valid || ((uint32_t) (now - g_state->last_rtc_ms) > MAINTENANCE_RTC_FRESH_MS))
+    { return MAINTENANCE_TIME_ERROR; }
+    F_Maintenance_UpdateUptime(g_context, now);
+    g_candidate = g_context->save;
+    g_candidate.calibration_pending = true;
+    g_candidate.rtc_target_seconds = day * 86400U + (uint32_t) g_date->hour * 3600U +
+        (uint32_t) g_date->minute * 60U + g_date->second;
+    g_state->calibration_base_seconds = g_state->calendar_ready ? g_state->calendar_seconds : g_candidate.calendar_seconds;
+    g_state->calibration_base_ms = g_state->calendar_ready ? g_state->last_rtc_ms : now;
+    result = F_Maintenance_Commit(g_context, &g_candidate);
+    if (result != MAINTENANCE_OK) { return result; } // 未确认校时意图已落盘时，绝不发送 RTC 修改指令。
+    g_state->calibration_target = *g_date;
+    g_state->calibration_phase = 1U;
+    g_state->calibration_result = MAINTENANCE_IN_PROGRESS;
+    g_state->calibration_notice = true;
+    g_state->rtc_pending = false;
+    return MAINTENANCE_IN_PROGRESS;
+}
+
+/*
+ * 函数名：F_Maintenance_GetRtcSetResult
+ * 说明：读取最近一次已受理的异步校时结果
+ * 输入：g_context：非空模块上下文指针
+ * 输出：返回 MAINTENANCE_NOT_READY 表示尚未校时，MAINTENANCE_IN_PROGRESS 表示进行中，MAINTENANCE_OK 表示已回读并保存，其余值表示失败
+ * 使用：仅供 A_Maintenance.c 跨文件调用；拒绝受理的请求通过 SetRtc 的返回值判断
+ */
+Maintenance_Result F_Maintenance_GetRtcSetResult(const Maintenance_Context *g_context)
+{
+    return g_context->state.initialized ? g_context->state.calibration_result : MAINTENANCE_NOT_READY;
+}
+
+/*
+ * 函数名：F_Maintenance_CalibrationInput
+ * 说明：校验屏幕校时输入通知，并将十四位年月日时分秒交给校时入口
+ * 输入：g_context：包含完整接收帧的非空上下文，输入格式为 YYYYMMDDhhmmss
+ * 输出：无返回值；g_context：合法请求进入校时流程，非法输入只更新提示，不修改 RTC 或保养起点
+ * 使用：仅在本 .c 文件内部调用，只处理配置页面的校时文本控件通知
+ */
+static void F_Maintenance_CalibrationInput(Maintenance_Context *g_context)
+{
+    const uint8_t *f = g_context->state.frame;
+    uint16_t values[7];
+    uint8_t i;
+    Maintenance_Date g_date;
+    Maintenance_Result result = MAINTENANCE_INVALID_ARGUMENT;
+    if ((MAINTENANCE_SCREEN_ID == 0xFFFFU) ||
+        (((uint16_t) f[3] << 8 | f[4]) != MAINTENANCE_SCREEN_ID) ||
+        (((uint16_t) f[5] << 8 | f[6]) != MAINTENANCE_RTC_INPUT_ID) || (f[7] != 0x11U)) { return; }
+    if (g_context->state.calibration_phase != 0U) { return; } // 重复提交不覆盖正在执行事务的目标和结果。
+    if ((g_context->state.frame_length == 27U) && (f[22] == 0U))
+    {
+        for (i = 0; i < 14U; ++i)
+        { if ((f[8U + i] < '0') || (f[8U + i] > '9')) { break; } }
+        if (i == 14U)
+        {
+            for (i = 0; i < 7U; ++i) { values[i] = (uint16_t) ((f[8U + i * 2U] - '0') * 10U + f[9U + i * 2U] - '0'); }
+            g_date.year = (uint16_t) (values[0] * 100U + values[1]);
+            g_date.month = (uint8_t) values[2]; g_date.day = (uint8_t) values[3];
+            g_date.hour = (uint8_t) values[4]; g_date.minute = (uint8_t) values[5]; g_date.second = (uint8_t) values[6];
+            result = F_Maintenance_SetRtc(g_context, &g_date);
+        }
+    }
+    g_context->state.calibration_result = result;
+    g_context->state.calibration_notice = true;
+}
+
+/*
+ * 函数名：F_Maintenance_CalibrationTask
+ * 说明：发送 RTC 修改指令、等待回读、保存新锚点并刷新中文校时结果
+ * 输入：g_context：非空模块上下文；now：当前毫秒计数，允许无符号回绕
+ * 输出：无返回值；g_context：推进校时状态，超时或保存失败时保留待确认记录并提示重新校准
+ * 使用：仅在本 .c 文件内部调用；每轮任务执行，发送忙时重试，重启后不会自动重发旧校时目标
+ */
+static void F_Maintenance_CalibrationTask(Maintenance_Context *g_context, uint32_t now)
+{
+    Maintenance_State *g_state = &g_context->state;
+    if (g_state->calibration_phase == 3U)
+    {
+        Maintenance_Save g_candidate = g_context->save;
+        g_candidate.calibration_pending = false;
+        g_candidate.rtc_target_seconds = 0;
+        F_Maintenance_UpdateUptime(g_context, now);
+        g_state->calibration_result = F_Maintenance_Commit(g_context, &g_candidate);
+        if (g_state->calibration_result != MAINTENANCE_OK) { g_state->calendar_ready = false; }
+        g_state->calibration_phase = 0;
+        g_state->calibration_notice = true;
+    }
+    else if ((g_state->calibration_phase != 0U) &&
+        ((uint32_t) (now - g_state->calibration_base_ms) > MAINTENANCE_CALIBRATION_TIMEOUT_MS))
+    {
+        g_state->calibration_phase = 0;
+        g_state->calendar_ready = false;
+        g_state->calibration_result = MAINTENANCE_TIME_ERROR;
+        g_state->calibration_notice = true;
+    }
+    else if (g_state->calibration_phase == 1U)
+    {
+        const Maintenance_Date *g_date = &g_state->calibration_target;
+        uint32_t day = 0;
+        uint8_t i, frame[] = {0xEE,0x81,0,0,0,0,0,0,0,0xFF,0xFC,0xFF,0xFF};
+        (void) F_Maintenance_DateToDay(g_date, &day);
+        frame[2] = g_date->second; frame[3] = g_date->minute; frame[4] = g_date->hour;
+        frame[5] = g_date->day; frame[6] = (uint8_t) ((day + 6U) % 7U); // 2000-01-01 为星期六，协议规定星期日为零。
+        frame[7] = g_date->month; frame[8] = (uint8_t) (g_date->year - 2000U);
+        for (i = 2U; i <= 8U; ++i) { frame[i] = (uint8_t) ((frame[i] / 10U) * 16U + frame[i] % 10U); }
+        if (H_Maintenance_PortSend(&g_context->port, frame, sizeof(frame)))
+        {
+            g_state->calibration_phase = 2U;
+            g_state->calibration_sent_ms = now;
+            g_state->last_rtc_request_ms = now; // 下一轮轮询读回目标，给屏幕完成 RTC 写入的时间。
+        }
+        return;
+    }
+    if (g_state->calibration_notice && g_state->screen_ready)
+    {
+        const char *text;
+        switch (g_state->calibration_result)
+        {
+            case MAINTENANCE_OK: text = "\xD0\xA3\xD7\xBC\xB3\xC9\xB9\xA6"; break; // 校准成功。
+            case MAINTENANCE_IN_PROGRESS: text = "\xD0\xA3\xD7\xBC\xD6\xD0"; break; // 校准中。
+            case MAINTENANCE_INVALID_ARGUMENT: text = "\xCA\xB1\xBC\xE4\xCE\xDE\xD0\xA7"; break; // 时间无效。
+            case MAINTENANCE_STORAGE_ERROR: text = "\xB4\xE6\xB4\xA2\xD2\xEC\xB3\xA3"; break; // 存储异常。
+            default: text = "\xC7\xEB\xD6\xD8\xD0\xC2\xD0\xA3\xD7\xBC"; break; // 请重新校准。
+        }
+        if (F_Maintenance_SendText(g_context, MAINTENANCE_RTC_RESULT_ID, text)) { g_state->calibration_notice = false; }
+    }
 }

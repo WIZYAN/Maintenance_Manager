@@ -11,7 +11,8 @@ typedef enum
     MAINTENANCE_TIME_ERROR,
     MAINTENANCE_STORAGE_ERROR,
     MAINTENANCE_STORAGE_CORRUPT,
-    MAINTENANCE_PORT_ERROR
+    MAINTENANCE_PORT_ERROR,
+    MAINTENANCE_IN_PROGRESS
 } Maintenance_Result;
 
 typedef enum
@@ -33,7 +34,7 @@ typedef struct
 typedef struct
 {
     uint16_t period_days;
-    uint32_t start_day;
+    uint32_t start_calendar_seconds;
     uint16_t period_hours;
     uint32_t start_uptime_seconds;
 } Maintenance_Item_Save;
@@ -52,7 +53,10 @@ typedef struct
 typedef struct
 {
     Maintenance_Item_Save machine, sensor;
-    uint32_t saved_day; // 保存日期水位，用于检测日期回退。
+    uint32_t rtc_anchor_seconds; // 与累计日历秒数配对保存的 RTC 原始秒数。
+    uint32_t calendar_seconds; // 不受人工校时影响的累计日历秒数。
+    uint32_t rtc_target_seconds; // 待校准目标；仅用于事务校验，不在重启后自动下发。
+    bool calibration_pending; // 已保存校时意图，尚未完成新时间确认及保存。
     uint32_t sequence; // 循环记录序号，比较时允许正常回绕。
     uint32_t uptime_seconds; // 最近成功保存的累计开机秒数。
 } Maintenance_Save; // 持久化参数只通过接口修改；EEPROM 使用显式字节布局，不依赖结构体内存布局。
@@ -80,7 +84,13 @@ typedef struct
     int8_t active_slot;
     uint32_t started_ms, last_rtc_request_ms, last_rtc_ms;
     uint32_t storage_retry_ms, frame_last_ms, display_ms;
-    uint32_t highest_day;
+    uint32_t rtc_seconds, calendar_seconds;
+    bool calendar_ready, calibration_notice;
+    uint8_t calibration_phase; // 0：空闲；1：待发送；2：待 RTC 回读；3：待保存确认结果。
+    Maintenance_Date calibration_target;
+    Maintenance_Result calibration_result;
+    uint32_t calibration_base_seconds, calibration_base_ms, calibration_sent_ms;
+    uint16_t calibration_remainder_ms; // 保留多次在线校时产生的不足一秒余数。
     uint16_t frame_length;
     uint8_t display_field;
     uint8_t frame[MAINTENANCE_FRAME_SIZE];
@@ -123,5 +133,23 @@ Maintenance_Result F_Maintenance_SetPeriod(Maintenance_Context *g_context, uint1
  * 使用：仅供 A_Maintenance.c 跨文件调用；主循环确认保养完成时使用，要求有效 RTC 和已加载的存储状态
  */
 Maintenance_Result F_Maintenance_ResetItem(Maintenance_Context *g_context, bool sensor);
+
+/*
+ * 函数名：F_Maintenance_SetRtc
+ * 说明：保存校时事务并发起异步 RTC 校准，保留两个保养项目已累计的时间
+ * 输入：g_context：非空模块上下文；g_date：2000～2099 年的合法目标日期时间
+ * 输出：返回 MAINTENANCE_IN_PROGRESS 表示已受理，其他值表示参数、时间、就绪或存储错误；g_context：更新校时状态
+ * 使用：供 A_Maintenance.c 跨文件调用，或本文件处理屏幕输入；主循环继续调度直到查询结果结束，校时过程中禁止复位或修改周期
+ */
+Maintenance_Result F_Maintenance_SetRtc(Maintenance_Context *g_context, const Maintenance_Date *g_date);
+
+/*
+ * 函数名：F_Maintenance_GetRtcSetResult
+ * 说明：读取最近一次已受理的异步校时结果
+ * 输入：g_context：非空模块上下文指针
+ * 输出：返回 MAINTENANCE_NOT_READY 表示尚未校时，MAINTENANCE_IN_PROGRESS 表示进行中，MAINTENANCE_OK 表示已回读并保存，其余值表示失败
+ * 使用：仅供 A_Maintenance.c 跨文件调用；拒绝受理的请求通过 SetRtc 的返回值判断
+ */
+Maintenance_Result F_Maintenance_GetRtcSetResult(const Maintenance_Context *g_context);
 
 #endif

@@ -85,3 +85,27 @@ void A_Maintenance_Task(void)
 {
     F_Maintenance_Task(&g_maintenance);
 }
+
+/*
+ * 函数名：A_Maintenance_SetRtc
+ * 说明：保存校时事务并发起异步 RTC 校准，保留两个保养项目已累计的时间
+ * 输入：g_date：2000～2099 年的合法目标日期时间
+ * 输出：返回 MAINTENANCE_IN_PROGRESS 表示已受理，其他值表示参数、时间、就绪或存储错误；无输出参数
+ * 使用：供其他应用模块跨文件调用；主循环继续调度直到查询结果结束，校时过程中禁止复位或修改周期
+ */
+Maintenance_Result A_Maintenance_SetRtc(const Maintenance_Date *g_date)
+{
+    return F_Maintenance_SetRtc(&g_maintenance, g_date);
+}
+
+/*
+ * 函数名：A_Maintenance_GetRtcSetResult
+ * 说明：读取最近一次已受理的异步校时结果
+ * 输入：无
+ * 输出：返回 MAINTENANCE_NOT_READY 表示尚未校时，MAINTENANCE_IN_PROGRESS 表示进行中，MAINTENANCE_OK 表示已回读并保存，其余值表示失败
+ * 使用：供其他应用模块跨文件调用；拒绝受理的请求通过 SetRtc 的返回值判断
+ */
+Maintenance_Result A_Maintenance_GetRtcSetResult(void)
+{
+    return F_Maintenance_GetRtcSetResult(&g_maintenance);
+}

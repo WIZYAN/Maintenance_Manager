@@ -11,6 +11,7 @@
 #define MAINTENANCE_SCREEN_BOOT_MS     2000U
 #define MAINTENANCE_RTC_POLL_MS        1000U
 #define MAINTENANCE_RTC_TIMEOUT_MS     500U
+#define MAINTENANCE_CALIBRATION_TIMEOUT_MS 10000U
 #define MAINTENANCE_RTC_FRESH_MS       3000U
 #define MAINTENANCE_STORAGE_RETRY_MS   5000U
 #define MAINTENANCE_FRAME_TIMEOUT_MS   200U
@@ -24,9 +25,9 @@
 #define MAINTENANCE_EEPROM_JOURNAL_BASE 0x7800U
 #define MAINTENANCE_EEPROM_SLOT_COUNT  32U
 
-// Screen0 仅负责显示，业务逻辑由 MCU 执行；控件编号 0xFFFF 表示禁用对应输出。
+// Screen0 负责显示与校时输入，业务逻辑由 MCU 执行；控件编号 0xFFFF 表示禁用对应输出。
 // 屏幕通信采用大彩协议，关闭 CRC，串口参数为 115200 波特率、8 数据位、无校验、1 停止位。
-// RTC 控件 10 显示的系统时间与指令 EE 82 查询的时间相同。
+// RTC 控件 10 仅显示系统时间；校时必须由控件 21 或 A_Maintenance_SetRtc 发起，禁止直接修改屏幕 RTC。
 #ifndef MAINTENANCE_SCREEN_ID
 #define MAINTENANCE_SCREEN_ID 0U
 #endif
@@ -36,6 +37,8 @@
 #define MAINTENANCE_SENSOR_PERIOD_ID    4U
 #define MAINTENANCE_MACHINE_BAR_ID      5U
 #define MAINTENANCE_SENSOR_BAR_ID       6U
+#define MAINTENANCE_RTC_INPUT_ID       21U
+#define MAINTENANCE_RTC_RESULT_ID      22U
 #define MAINTENANCE_RTC_CONTROL_ID     10U
 #define MAINTENANCE_MACHINE_HOURS_ID   17U
 #define MAINTENANCE_SENSOR_HOURS_ID    18U

@@ -15,15 +15,17 @@
 static uint8_t eeprom[32768];
 static uint8_t baseline[32768];
 static uint32_t now_ms;
-static unsigned writes, rtc_requests, displays;
+static unsigned writes, rtc_requests, rtc_sets, displays;
+static uint8_t last_rtc_set[13];
+static bool send_busy;
 static int fail_after = -1;
 static int fail_read_after = -1;
 static bool read_failure, init_failure;
 static unsigned port_initializations;
 static uint8_t last_display[MAINTENANCE_TX_SIZE];
 static uint16_t last_display_length;
-static uint8_t screen_frames[21][MAINTENANCE_TX_SIZE];
-static uint16_t screen_lengths[21];
+static uint8_t screen_frames[24][MAINTENANCE_TX_SIZE];
+static uint16_t screen_lengths[24];
 static uint16_t bar_colors[7];
 
 bool H_Maintenance_PortInit(Maintenance_Port *g_port) {
@@ -46,6 +48,7 @@ bool H_Maintenance_PortRxFault(Maintenance_Port *g_port)
 bool H_Maintenance_PortSend(Maintenance_Port *g_port, const uint8_t *data, uint16_t length)
 {
     (void) g_port;
+    if (send_busy) { return false; }
     assert(length <= MAINTENANCE_TX_SIZE);
     assert(data[0] == 0xEE);
     if (data[1] == 0x82)
@@ -55,10 +58,15 @@ bool H_Maintenance_PortSend(Maintenance_Port *g_port, const uint8_t *data, uint1
         assert(memcmp(data, expected, sizeof(expected)) == 0);
         ++rtc_requests;
     }
+    else if (data[1] == 0x81)
+    {
+        assert(length == 13U && memcmp(data + 9, tail, 4) == 0);
+        memcpy(last_rtc_set, data, length); ++rtc_sets;
+    }
     else
     {
         assert(data[1] == 0xB1 && (data[2] == 0x10 || data[2] == 0x19));
-        assert(data[5] == 0 && ((data[6] >= 1 && data[6] <= 6) || (data[6] >= 17 && data[6] <= 20)));
+        assert(data[5] == 0 && ((data[6] >= 1 && data[6] <= 6) || (data[6] >= 17 && data[6] <= 22)));
         if (data[2] == 0x19)
         {
             assert(length == 13 && (data[6] == 5 || data[6] == 6));
@@ -123,7 +131,7 @@ static void fresh(void)
 {
     memset(eeprom, 0xFF, sizeof(eeprom));
     fail_after = -1; fail_read_after = -1; read_failure = false; init_failure = false;
-    writes = 0; rtc_requests = 0; displays = 0;
+    writes = 0; rtc_requests = 0; rtc_sets = 0; displays = 0; send_busy = false;
     reboot();
 }
 static void sample(unsigned year, unsigned month, unsigned day)
@@ -169,23 +177,23 @@ static void test_lifecycle(void)
     fresh(); assert(writes == 0); assert(g_maintenance.state.storage_blank);
     assert(A_Maintenance_SetPeriodDays(150) == MAINTENANCE_TIME_ERROR);
     sample(2026,1,1);
-    start = g_maintenance.save.machine.start_day;
+    start = g_maintenance.save.machine.start_calendar_seconds;
     assert(g_maintenance.state.machine.remaining_days == 180 && g_maintenance.state.countdown_valid);
     old_writes = writes;
     sample(2026,1,31); assert(g_maintenance.state.machine.remaining_days == 150);
     assert(writes == old_writes);
     assert(A_Maintenance_SetPeriodDays(150) == MAINTENANCE_OK);
-    assert(g_maintenance.save.machine.start_day == start && g_maintenance.state.machine.remaining_days == 120);
+    assert(g_maintenance.save.machine.start_calendar_seconds == start && g_maintenance.state.machine.remaining_days == 120);
     old_writes = writes;
     assert(A_Maintenance_SetPeriodDays(150) == MAINTENANCE_OK && writes == old_writes);
     assert(A_Maintenance_SetPeriodDays(0) == MAINTENANCE_INVALID_ARGUMENT);
     assert(A_Maintenance_SetPeriodDays(65535U) == MAINTENANCE_INVALID_ARGUMENT);
     reboot(); sample(2026,2,10);
-    assert(g_maintenance.save.machine.start_day == start && g_maintenance.save.machine.period_days == 150);
+    assert(g_maintenance.save.machine.start_calendar_seconds == start && g_maintenance.save.machine.period_days == 150);
     assert(g_maintenance.state.machine.remaining_days == 110);
     sample(2027,1,1); assert(g_maintenance.state.status == MAINTENANCE_DUE && g_maintenance.state.machine.remaining_days == 0);
     assert(A_Maintenance_Reset() == MAINTENANCE_OK && g_maintenance.state.machine.remaining_days == 150);
-    assert(g_maintenance.save.machine.start_day != start);
+    assert(g_maintenance.save.machine.start_calendar_seconds != start);
     now_ms += MAINTENANCE_RTC_FRESH_MS + 1U;
     assert(A_Maintenance_Reset() == MAINTENANCE_TIME_ERROR);
     sample(2027,1,2); assert(g_maintenance.state.machine.remaining_days == 149);
@@ -205,7 +213,7 @@ static void test_protocol(void)
     fresh();
     for (i = 0; i < sizeof(packet); ++i) { enqueue(&packet[i], 1); A_Maintenance_Task(); }
     assert(g_maintenance.state.rtc_valid && g_maintenance.state.rtc.day == 29);
-    sample(2024,3,1); assert(g_maintenance.state.machine.remaining_days == 179);
+    sample(2024,3,1); assert(g_maintenance.state.machine.remaining_days == 180);
     now_ms += 1000; A_Maintenance_Task();
     packet[3] = 0x1A; enqueue(packet, sizeof(packet)); A_Maintenance_Task();
     assert(!g_maintenance.state.rtc_valid);
@@ -240,7 +248,7 @@ static void test_storage_failures(void)
     fresh(); sample(2026,1,1);
     memcpy(baseline, eeprom, sizeof(eeprom));
     /* Interrupt every byte of invalidate/payload/commit writes. */
-    for (cut = 0; cut < 50; ++cut)
+    for (cut = 0; cut < 62; ++cut)
     {
         memcpy(eeprom, baseline, sizeof(eeprom)); fail_after = -1;
         reboot(); sample(2026,1,31); fail_after = cut;
@@ -310,7 +318,7 @@ static void test_reused_pages_and_sequence(void)
     assert(A_Maintenance_SetPeriodDays(170) == MAINTENANCE_OK);
     assert(A_Maintenance_SetPeriodDays(160) == MAINTENANCE_OK);
     memcpy(baseline, eeprom, sizeof(eeprom));
-    for (cut = 0; cut < 50; ++cut)
+    for (cut = 0; cut < 62; ++cut)
     {
         memcpy(eeprom, baseline, sizeof(eeprom)); fail_after = -1;
         reboot(); sample(2026,1,31); fail_after = cut;
@@ -341,7 +349,7 @@ static void test_independent_items(void)
     uint32_t machine_start, sensor_start;
     int cut;
     fresh(); sample(2026,1,1);
-    machine_start = g_maintenance.save.machine.start_day;
+    machine_start = g_maintenance.save.machine.start_calendar_seconds;
     assert(A_Maintenance_SetSensorPeriodDays(90) == MAINTENANCE_OK);
     sample(2026,1,31);
     assert(g_maintenance.state.machine.remaining_days == 150);
@@ -349,16 +357,16 @@ static void test_independent_items(void)
     assert(g_maintenance.state.machine.progress_percent == 16);
     assert(g_maintenance.state.sensor.progress_percent == 33);
     assert(A_Maintenance_SetSensorPeriodDays(60) == MAINTENANCE_OK);
-    assert(g_maintenance.save.sensor.start_day == machine_start);
+    assert(g_maintenance.save.sensor.start_calendar_seconds == machine_start);
     assert(g_maintenance.state.sensor.remaining_days == 30);
     assert(A_Maintenance_ResetSensor() == MAINTENANCE_OK);
-    sensor_start = g_maintenance.save.sensor.start_day;
-    assert(sensor_start == machine_start + 30 && g_maintenance.save.machine.start_day == machine_start);
+    sensor_start = g_maintenance.save.sensor.start_calendar_seconds;
+    assert(sensor_start == machine_start + 30U * 86400U && g_maintenance.save.machine.start_calendar_seconds == machine_start);
     reboot(); sample(2026,2,10);
     assert(g_maintenance.state.machine.remaining_days == 140);
     assert(g_maintenance.state.sensor.remaining_days == 50);
     assert(A_Maintenance_Reset() == MAINTENANCE_OK);
-    assert(g_maintenance.save.sensor.start_day == sensor_start);
+    assert(g_maintenance.save.sensor.start_calendar_seconds == sensor_start);
     assert(g_maintenance.state.machine.remaining_days == 180);
     assert(A_Maintenance_SetSensorPeriodDays(10) == MAINTENANCE_OK);
     assert(g_maintenance.state.sensor.status == MAINTENANCE_DUE);
@@ -366,14 +374,14 @@ static void test_independent_items(void)
     assert(g_maintenance.state.status == MAINTENANCE_DUE);
     assert(g_maintenance.state.sensor.progress_percent == 100);
     memcpy(baseline, eeprom, sizeof(eeprom));
-    for (cut = 0; cut < 50; ++cut)
+    for (cut = 0; cut < 62; ++cut)
     {
         memcpy(eeprom, baseline, sizeof(eeprom)); fail_after = -1;
         reboot(); sample(2026,2,10); fail_after = cut;
         assert(A_Maintenance_SetSensorPeriodDays(120) == MAINTENANCE_STORAGE_ERROR);
         fail_after = -1; reboot(); sample(2026,2,11);
         assert(g_maintenance.save.sensor.period_days == 10);
-        assert(g_maintenance.save.sensor.start_day == sensor_start);
+        assert(g_maintenance.save.sensor.start_calendar_seconds == sensor_start);
         assert(g_maintenance.state.machine.remaining_days == 179);
     }
 }
@@ -385,6 +393,8 @@ static void legacy_record(void)
     unsigned i, bit;
     /* Turn a real record into the exact previous v1 format, with a valid CRC. */
     p[4] = 1; p[6] = 32;
+    F_Maintenance_Put32(p + 12, F_Maintenance_Get32(p + 12) / 86400U);
+    F_Maintenance_Put32(p + 16, F_Maintenance_Get32(p + 16) / 86400U);
     memset(p + 22, 0, 6);
     for (i = 0; i < 28; ++i)
     {
@@ -399,9 +409,9 @@ static void test_legacy_migration(void)
 {
     uint32_t start;
     int cut;
-    fresh(); sample(2026,1,1); start = g_maintenance.save.machine.start_day;
+    fresh(); sample(2026,1,1); start = g_maintenance.save.machine.start_calendar_seconds;
     legacy_record(); memcpy(baseline, eeprom, sizeof(eeprom));
-    for (cut = 0; cut < 50; ++cut)
+    for (cut = 0; cut < 62; ++cut)
     {
         memcpy(eeprom, baseline, sizeof(eeprom)); fail_after = -1; reboot();
         assert(g_maintenance.state.migration_pending);
@@ -410,10 +420,10 @@ static void test_legacy_migration(void)
         assert(eeprom[MAINTENANCE_EEPROM_SLOT0 + 4] == 1);
         fail_after = -1; reboot(); sample(2026,2,10);
         assert(!g_maintenance.state.migration_pending);
-        assert(g_maintenance.save.machine.start_day == start);
+        assert(g_maintenance.save.machine.start_calendar_seconds == start);
         assert(g_maintenance.state.machine.remaining_days == 140);
         assert(g_maintenance.state.sensor.remaining_days == MAINTENANCE_SENSOR_DEFAULT_DAYS);
-        assert(eeprom[MAINTENANCE_EEPROM_SLOT1 + 4] == 3);
+        assert(eeprom[MAINTENANCE_EEPROM_SLOT1 + 4] == 4);
     }
     reboot(); sample(2026,2,11);
     assert(g_maintenance.state.machine.remaining_days == 139);
@@ -467,19 +477,19 @@ static void test_reset_all_request(void)
     unsigned old_writes, i;
     int cut;
     fresh(); sample(2020,1,1);
-    assert(g_maintenance.save.machine.start_day == 7305);
+    assert(g_maintenance.save.machine.start_calendar_seconds == (7305U * 86400U + 45296U));
     sample(2026,9,22);
     assert(g_maintenance.state.current_day == 9761);
     assert(g_maintenance.state.machine.elapsed_days == 2456);
-    old_start = g_maintenance.save.machine.start_day;
+    old_start = g_maintenance.save.machine.start_calendar_seconds;
     /* Reproduce the reported old origin; RTC must be fresh before resetting. */
     now_ms += MAINTENANCE_RTC_FRESH_MS + 1;
     g_maintenance.state.reset_all_request = true;
     A_Maintenance_Task();
-    assert(g_maintenance.state.reset_all_request && g_maintenance.save.machine.start_day == old_start);
+    assert(g_maintenance.state.reset_all_request && g_maintenance.save.machine.start_calendar_seconds == old_start);
     sample(2026,9,22);
     assert(!g_maintenance.state.reset_all_request && g_maintenance.state.reset_all_result == MAINTENANCE_OK);
-    assert(g_maintenance.save.machine.start_day == 9761 && g_maintenance.save.sensor.start_day == 9761);
+    assert(g_maintenance.save.machine.start_calendar_seconds == (9761U * 86400U + 45296U) && g_maintenance.save.sensor.start_calendar_seconds == (9761U * 86400U + 45296U));
     assert(g_maintenance.save.machine.period_days == 180 && g_maintenance.save.sensor.period_days == 180);
     assert(g_maintenance.state.machine.elapsed_days == 0 && g_maintenance.state.sensor.elapsed_days == 0);
     if (MAINTENANCE_SCREEN_ID != 0xFFFFU)
@@ -496,7 +506,7 @@ static void test_reset_all_request(void)
     assert(A_Maintenance_SetSensorPeriodDays(90) == MAINTENANCE_OK);
     memcpy(baseline, eeprom, sizeof(eeprom));
     /* Atomic two-item reset: every torn write leaves both old origins intact. */
-    for (cut = 0; cut < 50; ++cut)
+    for (cut = 0; cut < 62; ++cut)
     {
         memcpy(eeprom, baseline, sizeof(eeprom)); fail_after = -1;
         reboot(); sample(2026,9,24);
@@ -507,12 +517,12 @@ static void test_reset_all_request(void)
         for (i = 0; i < 20; ++i) { A_Maintenance_Task(); }
         assert(writes == old_writes);
         fail_after = -1; reboot(); sample(2026,9,24);
-        assert(g_maintenance.save.machine.start_day == 9761 && g_maintenance.save.sensor.start_day == 9761);
+        assert(g_maintenance.save.machine.start_calendar_seconds == (9761U * 86400U + 45296U) && g_maintenance.save.sensor.start_calendar_seconds == (9761U * 86400U + 45296U));
         assert(g_maintenance.save.machine.period_days == 180 && g_maintenance.save.sensor.period_days == 90);
     }
     g_maintenance.state.reset_all_request = true; A_Maintenance_Task();
     assert(g_maintenance.state.reset_all_result == MAINTENANCE_OK);
-    assert(g_maintenance.save.machine.start_day == 9763 && g_maintenance.save.sensor.start_day == 9763);
+    assert(g_maintenance.save.machine.start_calendar_seconds == (9763U * 86400U + 45296U) && g_maintenance.save.sensor.start_calendar_seconds == (9763U * 86400U + 45296U));
     assert(g_maintenance.save.machine.period_days == 180 && g_maintenance.save.sensor.period_days == 90);
 }
 
@@ -612,28 +622,31 @@ static void test_hours_recovery(void)
     now_ms += 5000U; A_Maintenance_Task(); sample(2026,1,31);
     assert(g_maintenance.save.machine.period_hours == 9000);
     assert(g_maintenance.state.uptime_seconds == saved + 5U);
-    start = g_maintenance.save.machine.start_day;
+    start = g_maintenance.save.machine.start_calendar_seconds;
     for (i = 0; i < 80; ++i) { advance_on(60U); }
     assert(g_maintenance.save.sequence > MAINTENANCE_EEPROM_SLOT_COUNT);
     for (i = 0; i < MAINTENANCE_EEPROM_SLOT_COUNT; ++i)
     { assert(eeprom[MAINTENANCE_EEPROM_JOURNAL_BASE + i * 64U + 63U] == 0xA5); }
     saved = g_maintenance.save.uptime_seconds;
     reboot(); sample(2026,1,31);
-    assert(g_maintenance.state.uptime_seconds == saved + 2U && g_maintenance.save.machine.start_day == start);
+    assert(g_maintenance.state.uptime_seconds == saved + 2U && g_maintenance.save.machine.start_calendar_seconds == start);
 }
 
 static void test_v2_migration(void)
 {
     unsigned slot, i, bit;
     uint32_t machine_start, sensor_start;
-    fresh(); sample(2026,1,1); machine_start = g_maintenance.save.machine.start_day;
+    fresh(); sample(2026,1,1); machine_start = g_maintenance.save.machine.start_calendar_seconds;
     sample(2026,1,15); assert(A_Maintenance_ResetSensor() == MAINTENANCE_OK);
-    sensor_start = g_maintenance.save.sensor.start_day;
+    sensor_start = g_maintenance.save.sensor.start_calendar_seconds;
     for (slot = 0; slot < 2; ++slot)
     {
         uint8_t *p = &eeprom[MAINTENANCE_EEPROM_SLOT0 + slot * 64];
         uint32_t crc = UINT32_MAX;
         p[4] = 2; p[6] = 32;
+        F_Maintenance_Put32(p + 12, F_Maintenance_Get32(p + 12) / 86400U);
+        F_Maintenance_Put32(p + 16, F_Maintenance_Get32(p + 16) / 86400U);
+        F_Maintenance_Put32(p + 22, F_Maintenance_Get32(p + 22) / 86400U);
         for (i = 0; i < 28; ++i)
         {
             crc ^= p[i];
@@ -644,8 +657,8 @@ static void test_v2_migration(void)
     }
     reboot(); assert(g_maintenance.state.migration_pending && g_maintenance.state.loaded_version == 2);
     sample(2026,1,31);
-    assert(g_maintenance.state.loaded_version == 3 && !g_maintenance.state.migration_pending);
-    assert(g_maintenance.save.machine.start_day == machine_start && g_maintenance.save.sensor.start_day == sensor_start);
+    assert(g_maintenance.state.loaded_version == 4 && !g_maintenance.state.migration_pending);
+    assert(g_maintenance.save.machine.start_calendar_seconds == machine_start && g_maintenance.save.sensor.start_calendar_seconds == sensor_start);
     assert(g_maintenance.state.machine.elapsed_days == 30 && g_maintenance.state.sensor.elapsed_days == 16);
     assert(g_maintenance.state.machine.used_hours == 0 && g_maintenance.state.sensor.used_hours == 0);
     /* RTC outage must not suspend on-time accumulation or its checkpoint. */
@@ -720,6 +733,261 @@ static void test_module_entry(void)
     assert(port_initializations == 1);
 }
 
+
+/*
+ * 函数名：sample_at
+ * 说明：注入秒级 RTC 回包，覆盖原来仅按日期注入无法检查的边界
+ * 输入：g_date：完整 RTC 时间
+ * 输出：无；更新假硬件和模块状态，断言失败时终止测试
+ * 使用：仅本测试文件调用
+ */
+static void sample_at(Maintenance_Date g_date)
+{
+    uint8_t packet[] = {0xEE,0xF7,0,0,0,0,0,0,0,0xFF,0xFC,0xFF,0xFF};
+    if (!g_maintenance.state.rtc_pending) { now_ms += 1000U; A_Maintenance_Task(); }
+    assert(g_maintenance.state.rtc_pending);
+    packet[2] = bcd(g_date.year - 2000U); packet[3] = bcd(g_date.month); packet[5] = bcd(g_date.day);
+    packet[6] = bcd(g_date.hour); packet[7] = bcd(g_date.minute); packet[8] = bcd(g_date.second);
+    enqueue(packet, sizeof(packet)); A_Maintenance_Task();
+}
+
+/*
+ * 函数名：test_elapsed_seconds
+ * 说明：验证跨午夜、累计 24 小时边界、秒级进度和重启补时
+ * 输入：无
+ * 输出：无；断言验证新计时规则
+ * 使用：主机回归测试
+ */
+static void test_elapsed_seconds(void)
+{
+    Maintenance_Date g_date = {2024,2,29,23,59,59};
+    uint32_t origin;
+    fresh(); sample_at(g_date); origin = g_maintenance.save.machine.start_calendar_seconds;
+    assert(A_Maintenance_SetPeriodDays(1) == MAINTENANCE_OK);
+    g_date.month = 3; g_date.day = 1; g_date.hour = 0; g_date.minute = 0; g_date.second = 0;
+    sample_at(g_date);
+    assert(g_maintenance.state.machine.elapsed_days == 0 && g_maintenance.state.machine.remaining_days == 1);
+    g_date.hour = 11; g_date.minute = 59; g_date.second = 59; sample_at(g_date);
+    assert(g_maintenance.state.machine.elapsed_days == 0 && g_maintenance.state.machine.day_percent == 50);
+    assert(A_Maintenance_SetSensorPeriodDays(90) == MAINTENANCE_OK);
+    reboot(); g_date.hour = 23; g_date.second = 58; sample_at(g_date);
+    assert(g_maintenance.state.calendar_seconds - origin == 86399U);
+    assert(g_maintenance.state.machine.elapsed_days == 0 && g_maintenance.state.machine.day_percent == 99);
+    g_date.second = 59; sample_at(g_date);
+    assert(g_maintenance.state.machine.elapsed_days == 1 && g_maintenance.state.machine.remaining_days == 0);
+    assert(g_maintenance.state.machine.status == MAINTENANCE_DUE);
+    assert(A_Maintenance_ResetSensor() == MAINTENANCE_OK);
+    g_date.day = 2; g_date.hour = 0; g_date.minute = 0; g_date.second = 0; sample_at(g_date);
+    assert(g_maintenance.state.sensor.elapsed_days == 0 && g_maintenance.state.machine.elapsed_days == 1);
+}
+
+/*
+ * 函数名：calibrate
+ * 说明：完成一次受控校时并验证下发帧、双项目起点、累计秒数和持久化结果
+ * 输入：g_date：校时目标日期时间
+ * 输出：无；断言检查 RTC 跳变未计入保养时间
+ * 使用：仅本测试文件调用
+ */
+static void calibrate(Maintenance_Date g_date)
+{
+    uint32_t before = g_maintenance.state.calendar_seconds;
+    uint32_t start = g_maintenance.save.machine.start_calendar_seconds;
+    uint32_t sensor_start = g_maintenance.save.sensor.start_calendar_seconds;
+    uint32_t begin_ms = g_maintenance.state.last_rtc_ms;
+    uint32_t day;
+    assert(A_Maintenance_SetRtc(&g_date) == MAINTENANCE_IN_PROGRESS);
+    assert(A_Maintenance_GetRtcSetResult() == MAINTENANCE_IN_PROGRESS);
+    assert(A_Maintenance_Reset() == MAINTENANCE_NOT_READY);
+    assert(A_Maintenance_ResetSensor() == MAINTENANCE_NOT_READY);
+    assert(A_Maintenance_SetPeriodDays(200) == MAINTENANCE_NOT_READY);
+    A_Maintenance_Task(); assert(g_maintenance.state.calibration_phase == 2);
+    assert(F_Maintenance_DateToDay(&g_date, &day));
+    assert(last_rtc_set[2] == bcd(g_date.second) && last_rtc_set[3] == bcd(g_date.minute));
+    assert(last_rtc_set[4] == bcd(g_date.hour) && last_rtc_set[5] == bcd(g_date.day));
+    assert(last_rtc_set[6] == bcd((day + 6U) % 7U));
+    assert(last_rtc_set[7] == bcd(g_date.month) && last_rtc_set[8] == bcd(g_date.year - 2000U));
+    sample_at(g_date);
+    assert(A_Maintenance_GetRtcSetResult() == MAINTENANCE_OK);
+    assert(!g_maintenance.save.calibration_pending && g_maintenance.state.countdown_valid);
+    assert(g_maintenance.state.calendar_seconds == before + (now_ms - begin_ms) / 1000U);
+    assert(g_maintenance.save.machine.start_calendar_seconds == start);
+    assert(g_maintenance.save.sensor.start_calendar_seconds == sensor_start);
+}
+
+/*
+ * 函数名：test_calibration
+ * 说明：验证前调、后调、重复校时、断电补时、串口繁忙与超时恢复
+ * 输入：无
+ * 输出：无；断言验证校时与累计时间独立
+ * 使用：主机回归测试，串口发送由假硬件记录
+ */
+static void test_calibration(void)
+{
+    Maintenance_Date g_target = {2099,12,30,12,0,0};
+    uint32_t before;
+    unsigned count;
+    fresh(); sample(2026,1,1); sample(2026,1,31);
+    calibrate(g_target);
+    assert(g_maintenance.state.machine.elapsed_days == 30 && g_maintenance.state.sensor.elapsed_days == 30);
+    g_target.year = 2000; g_target.month = 1; g_target.day = 1;
+    calibrate(g_target); calibrate(g_target);
+    assert(g_maintenance.state.machine.elapsed_days == 30);
+    before = g_maintenance.state.calendar_seconds;
+    reboot(); g_target.day = 3; sample_at(g_target);
+    assert(g_maintenance.state.calendar_seconds == before + 2U * 86400U);
+    assert(g_maintenance.state.machine.elapsed_days == 32);
+    assert(A_Maintenance_Reset() == MAINTENANCE_OK);
+    assert(g_maintenance.state.machine.elapsed_days == 0 && g_maintenance.state.sensor.elapsed_days == 32);
+    g_target.day = 4; sample_at(g_target);
+    assert(g_maintenance.state.machine.elapsed_days == 1 && g_maintenance.state.sensor.elapsed_days == 33);
+    assert(A_Maintenance_SetRtc(NULL) == MAINTENANCE_INVALID_ARGUMENT);
+    g_target.month = 13;
+    assert(A_Maintenance_SetRtc(&g_target) == MAINTENANCE_INVALID_ARGUMENT);
+    g_target.month = 1; g_target.day = 1;
+    before = g_maintenance.state.calendar_seconds; count = rtc_sets;
+    assert(A_Maintenance_SetRtc(&g_target) == MAINTENANCE_IN_PROGRESS);
+    assert(A_Maintenance_SetRtc(&g_target) == MAINTENANCE_NOT_READY);
+    send_busy = true; now_ms += 1500U; A_Maintenance_Task(); assert(rtc_sets == count);
+    send_busy = false; A_Maintenance_Task(); assert(rtc_sets == count + 1);
+    sample_at(g_target);
+    assert(g_maintenance.state.calendar_seconds == before + 2U);
+    assert(g_maintenance.state.calibration_remainder_ms == 500U);
+    assert(A_Maintenance_SetRtc(&g_target) == MAINTENANCE_IN_PROGRESS);
+    A_Maintenance_Task(); now_ms += MAINTENANCE_CALIBRATION_TIMEOUT_MS + 1U; A_Maintenance_Task();
+    assert(A_Maintenance_GetRtcSetResult() == MAINTENANCE_TIME_ERROR && g_maintenance.save.calibration_pending);
+    sample_at(g_target); assert(!g_maintenance.state.countdown_valid);
+    before = g_maintenance.save.calendar_seconds;
+    now_ms += 65000U; A_Maintenance_Task();
+    assert(g_maintenance.save.calibration_pending && g_maintenance.save.calendar_seconds == before);
+    assert(g_maintenance.save.uptime_seconds == g_maintenance.state.uptime_seconds);
+    sample_at(g_target);
+    calibrate(g_target);
+}
+
+/*
+ * 函数名：test_calibration_power_cuts
+ * 说明：逐字节模拟校时前保存失败、校时后保存失败和最终回读失败
+ * 输入：无
+ * 输出：无；确认没有已保存意图就不改 RTC，未确认事务重启后不猜测时间差
+ * 使用：主机回归测试，不替代 EEPROM 实际断电测试
+ */
+static void test_calibration_power_cuts(void)
+{
+    Maintenance_Date g_target = {2000,1,1,12,34,56};
+    int cut;
+    uint32_t before;
+    fresh(); sample(2026,1,1); memcpy(baseline, eeprom, sizeof(eeprom));
+    for (cut = 0; cut < 62; ++cut)
+    {
+        memcpy(eeprom, baseline, sizeof(eeprom)); fail_after = -1; reboot(); sample(2026,1,31);
+        rtc_sets = 0; fail_after = cut;
+        assert(A_Maintenance_SetRtc(&g_target) == MAINTENANCE_STORAGE_ERROR);
+        A_Maintenance_Task(); assert(rtc_sets == 0);
+        fail_after = -1; reboot(); sample(2026,2,1);
+        assert(g_maintenance.state.machine.elapsed_days == 31 && !g_maintenance.save.calibration_pending);
+    }
+    for (cut = 0; cut < 62; ++cut)
+    {
+        memcpy(eeprom, baseline, sizeof(eeprom)); fail_after = -1; reboot(); sample(2026,1,31);
+        before = g_maintenance.state.calendar_seconds;
+        assert(A_Maintenance_SetRtc(&g_target) == MAINTENANCE_IN_PROGRESS);
+        A_Maintenance_Task(); fail_after = cut; sample_at(g_target);
+        assert(A_Maintenance_GetRtcSetResult() == MAINTENANCE_STORAGE_ERROR);
+        fail_after = -1; reboot(); sample_at(g_target);
+        assert(g_maintenance.save.calibration_pending && !g_maintenance.state.countdown_valid);
+        assert(g_maintenance.state.calendar_seconds == before);
+        calibrate(g_target); assert(g_maintenance.state.machine.elapsed_days == 30);
+    }
+    fresh(); sample(2026,1,1); sample(2026,1,31);
+    fail_read_after = 2;
+    assert(A_Maintenance_SetRtc(&g_target) == MAINTENANCE_STORAGE_ERROR);
+    A_Maintenance_Task(); assert(rtc_sets == 0);
+    reboot(); sample(2026,1,31);
+    assert(g_maintenance.save.calibration_pending && !g_maintenance.state.countdown_valid);
+    calibrate(g_target);
+    assert(A_Maintenance_SetRtc(&g_target) == MAINTENANCE_IN_PROGRESS);
+    A_Maintenance_Task(); fail_read_after = 2; sample_at(g_target);
+    assert(A_Maintenance_GetRtcSetResult() == MAINTENANCE_STORAGE_ERROR);
+    reboot(); g_target.day = 2; sample_at(g_target);
+    assert(!g_maintenance.save.calibration_pending && g_maintenance.state.countdown_valid);
+    assert(g_maintenance.state.machine.elapsed_days == 31);
+    before = g_maintenance.state.calendar_seconds;
+    assert(A_Maintenance_SetRtc(&g_target) == MAINTENANCE_IN_PROGRESS);
+    reboot(); sample_at(g_target);
+    assert(g_maintenance.save.calibration_pending && g_maintenance.state.calendar_seconds == before);
+    calibrate(g_target);
+}
+
+/*
+ * 函数名：test_calibration_input
+ * 说明：验证屏幕校时通知的页面、控件、类型、长度、数字和日期校验
+ * 输入：无
+ * 输出：无；合法通知受理校时，其余通知不得修改 RTC
+ * 使用：主机回归测试，同时覆盖禁用屏幕配置
+ */
+static void test_calibration_input(void)
+{
+    uint8_t frame[27] = {0xEE,0xB1,0x11,0,0,0,MAINTENANCE_RTC_INPUT_ID,0x11};
+    unsigned i, old_writes;
+    fresh(); sample(2026,1,1);
+    memcpy(frame + 8, "20301231125959", 15); memcpy(frame + 23, tail, 4);
+    old_writes = writes;
+    for (i = 3; i <= 7; ++i)
+    {
+        frame[i] ^= 1; enqueue(frame, sizeof(frame)); A_Maintenance_Task(); frame[i] ^= 1;
+        assert(writes == old_writes && rtc_sets == 0);
+    }
+    frame[8] = 'x'; enqueue(frame, sizeof(frame)); A_Maintenance_Task(); frame[8] = '2';
+    frame[12] = '9'; enqueue(frame, sizeof(frame)); A_Maintenance_Task(); frame[12] = '1';
+    frame[22] = '0'; enqueue(frame, sizeof(frame)); A_Maintenance_Task(); frame[22] = 0;
+    enqueue(frame, 20); enqueue(tail, 4); A_Maintenance_Task();
+    assert(writes == old_writes && rtc_sets == 0);
+    enqueue(frame, sizeof(frame)); A_Maintenance_Task();
+    if (MAINTENANCE_SCREEN_ID == 0xFFFFU) { assert(rtc_sets == 0 && writes == old_writes); }
+    else
+    {
+        Maintenance_Date g_target = {2030,12,31,12,59,59};
+        assert(rtc_sets == 1 && g_maintenance.save.calibration_pending);
+        enqueue(frame, sizeof(frame)); A_Maintenance_Task(); assert(rtc_sets == 1);
+        sample_at(g_target);
+        assert(A_Maintenance_GetRtcSetResult() == MAINTENANCE_OK && g_maintenance.state.machine.elapsed_days == 0);
+    }
+}
+
+/*
+ * 函数名：test_v3_migration
+ * 说明：验证旧版日期记录升级保留整天数及开机小时，未知的日内起点从迁移时开始
+ * 输入：无
+ * 输出：无；断言验证 v3 到 v4 的字段单位转换
+ * 使用：主机回归测试
+ */
+static void test_v3_migration(void)
+{
+    uint8_t *p;
+    uint32_t uptime;
+    Maintenance_Date g_date = {2026,2,1,0,0,0};
+    fresh(); sample(2026,1,1); sample(2026,1,31); advance_on(7200U);
+    assert(A_Maintenance_ResetSensor() == MAINTENANCE_OK);
+    uptime = g_maintenance.save.uptime_seconds;
+    p = eeprom + F_Maintenance_SlotAddress((uint8_t) g_maintenance.state.active_slot);
+    memmove(baseline, p, 64);
+    memset(eeprom, 0xFF, sizeof(eeprom)); p = eeprom + MAINTENANCE_EEPROM_SLOT0;
+    memcpy(p, baseline, 64); p[4] = 3; p[6] = 48;
+    F_Maintenance_Put32(p + 12, F_Maintenance_Get32(p + 12) / 86400U);
+    F_Maintenance_Put32(p + 16, F_Maintenance_Get32(p + 16) / 86400U);
+    F_Maintenance_Put32(p + 22, F_Maintenance_Get32(p + 22) / 86400U);
+    F_Maintenance_Put32(p + 44, F_Maintenance_Crc32(p, 44));
+    reboot(); assert(g_maintenance.state.loaded_version == 3); sample_at(g_date);
+    assert(g_maintenance.state.loaded_version == 4 && !g_maintenance.state.migration_pending);
+    assert(g_maintenance.state.machine.elapsed_days == 31 && g_maintenance.state.sensor.elapsed_days == 1);
+    assert(g_maintenance.state.machine.used_hours == 2 && g_maintenance.state.sensor.used_hours == 0);
+    assert(g_maintenance.save.uptime_seconds == uptime + 2);
+    g_date.hour = 23; g_date.minute = 59; g_date.second = 59; sample_at(g_date);
+    assert(g_maintenance.state.machine.elapsed_days == 31);
+    g_date.day = 2; g_date.hour = 0; g_date.minute = 0; g_date.second = 0; sample_at(g_date);
+    assert(g_maintenance.state.machine.elapsed_days == 32);
+}
+
 int main(void)
 {
     test_calendar(); test_lifecycle(); test_protocol(); test_storage_failures(); test_tick_wrap_and_display();
@@ -729,6 +997,8 @@ int main(void)
     test_operating_hours(); test_hours_recovery(); test_v2_migration();
     test_context_isolation();
     test_module_entry();
-    puts("PASS: calendar, uptime, max progress, red/blue bars, power cuts, journal, migration, reset, context isolation, module entry");
+    test_elapsed_seconds(); test_calibration(); test_calibration_power_cuts();
+    test_calibration_input(); test_v3_migration();
+    puts("PASS: 24-hour boundaries, RTC calibration, input validation, calibration power cuts, v1/v2/v3 migration, uptime, display, journal, reset, module entry");
     return 0;
 }
