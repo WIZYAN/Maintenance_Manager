@@ -22,17 +22,18 @@ def main():
     parser.add_argument("--host-only", action="store_true")
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
-    core = [PROJECT / "src" / f for f in
-            ["Maintenance.c", "maintenance_storage.c", "maintenance_protocol.c"]]
+    # The white-box host test includes F_Maintenance.c; do not compile it twice.
+    core = [PROJECT / f for f in
+            ["Maintenance/A_Maintenance.c"]]
     for display in [False, True]:
         binary = OUT / ("test-display.exe" if display else "test-core.exe")
         defines = [] if display else ["-DMAINTENANCE_SCREEN_ID=0xFFFF"]
         run([args.host_gcc, "-std=c99", "-Wall", "-Wextra", "-Werror", "-O2",
-             "-I", PROJECT / "src", *defines, *core, ROOT / "tests/test_maintenance.c", "-o", binary])
+             "-I", PROJECT, *defines, *core, ROOT / "tools/tests/test_maintenance.c", "-o", binary])
         run([binary])
     if args.host_only:
         return
-    includes = ["src", "ra_gen", "ra_cfg/fsp_cfg", "ra_cfg/fsp_cfg/bsp", "ra/fsp/inc",
+    includes = [".", "src", "ra_gen", "ra_cfg/fsp_cfg", "ra_cfg/fsp_cfg/bsp", "ra/fsp/inc",
                 "ra/fsp/inc/api", "ra/fsp/inc/instances", "ra/arm/CMSIS_5/CMSIS/Core/Include"]
     flags = ["-mcpu=cortex-m4", "-mthumb", "-mfpu=fpv4-sp-d16", "-mfloat-abi=hard",
              "-std=c99", "-D_RENESAS_RA_", "-D_RA_CORE=CM4", "-Wall", "-Wextra", "-Og", "-g3",
@@ -40,10 +41,10 @@ def main():
     for include in includes:
         flags += ["-I", PROJECT / include]
     objects = []
-    for folder in ["src", "ra_gen", "ra"]:
+    for folder in ["src", "Maintenance", "ra_gen", "ra"]:
         for source in sorted((PROJECT / folder).rglob("*.c")):
             obj = OUT / ("_".join(source.relative_to(PROJECT).parts) + ".o")
-            strict = ["-Werror"] if folder == "src" else []
+            strict = ["-Werror"] if folder in ["src", "Maintenance"] else []
             run([args.arm_gcc, *flags, *strict, "-c", source, "-o", obj])
             objects.append(obj)
     elf = OUT / "Maintenance_Manager.elf"

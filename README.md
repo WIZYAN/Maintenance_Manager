@@ -26,16 +26,37 @@
 
 所有业务计算、判断、颜色控制、复位和 EEPROM 保存均在 MCU 完成。屏幕无新增 Lua、变量绑定、控件联动或业务计时器。屏幕 RTC 控件 10 与 MCU 查询使用同一个系统时钟。
 
+## 代码分层
+
+```text
+Maintenance_Manager/
+├── src/
+│   └── hal_entry.c                   FSP 固定入口，持有上下文并调度 A 接口
+└── Maintenance/
+    ├── A_Maintenance.c / .h          外部业务接口
+    ├── F_Maintenance.c / .h          维保计算、协议、存储记录等模块功能
+    ├── H_Maintenance.c / .h          RA UART、SysTick、GPIO、软件 I²C
+    └── Maintenance_Config.h         配置宏
+```
+
+维保模块头文件按 `A_Maintenance.h → F_Maintenance.h → H_Maintenance.h` 向下包含，只定义接口所需类型、声明和宏，不含函数实现。其他模块只调用 `A_` 接口；A 层调用 F 层入口，F 层通过 H 层操作硬件。F 层内部的计算、协议、记录辅助函数集中在同一 `.c` 内并设为 `static`，避免导出仅供内部使用的函数。跨 `.c` 的 A/F/H 接口在头文件中注明调用范围。
+
+`hal_entry.c` 不受模块分层和同名头文件规则约束，保留原来的 FSP 入口结构，包括 `R_BSP_WarmStart`、引脚初始化和安全构建代码；主循环只负责调用模块的 A 接口。维保模块自身的外设操作放在 H 层，`SysTick_Handler`、`DIS_Callback` 保留中断向量和 FSP 要求的名称。`ra/`、`ra_gen/`、`ra_cfg/` 中的厂商库及生成代码保持原状。
+
+此次调整改变了 C 接口名称和参数，原有调用需要迁移到下方示例；计时规则、屏幕协议、EEPROM 格式和保存顺序保持不变。
+
 ## 调用接口
 
 主循环持续调用一个任务函数，工程已接入：
 
 ```c
-#include "Maintenance.h"
+#include "Maintenance/A_Maintenance.h"
+
+static Maintenance_Context g_maintenance;  /* 零初始化，生命周期覆盖硬件运行期 */
 
 while (1)
 {
-    Maintenance_Task();
+    A_Maintenance_Task(&g_maintenance);
     /* 其他非阻塞任务 */
 }
 ```
@@ -43,30 +64,34 @@ while (1)
 以下为独立的操作示例，应在对应用户事件发生时调用，不要每个循环都执行：
 
 ```c
-Maintenance_SetPeriodDays(150);          // 整机日历周期：保留原起点
-Maintenance_SetSensorPeriodDays(180);    // 传感器日历周期
-Maintenance_SetPeriodHours(8000);        // 整机小时周期：保留已用时间
-Maintenance_SetSensorPeriodHours(8000);  // 传感器小时周期
+A_Maintenance_SetPeriodDays(&g_maintenance, 150);          // 整机日历周期：保留原起点
+A_Maintenance_SetSensorPeriodDays(&g_maintenance, 180);    // 传感器日历周期
+A_Maintenance_SetPeriodHours(&g_maintenance, 8000);        // 整机小时周期：保留已用时间
+A_Maintenance_SetSensorPeriodHours(&g_maintenance, 8000);  // 传感器小时周期
 
-Maintenance_Reset();        // 整机：从今天、当前累计开机时间重新开始
-Maintenance_ResetSensor();  // 传感器：两项一起重新开始
+A_Maintenance_Reset(&g_maintenance);        // 整机：从今天、当前累计开机时间重新开始
+A_Maintenance_ResetSensor(&g_maintenance);  // 传感器：两项一起重新开始
 ```
 
 日历周期范围 1～36500 天，小时周期范围 1～65535 h。返回 `MAINTENANCE_OK` 才表示操作成功；实际保存的操作需完成 EEPROM 回读校验。重复设置相同周期不重复写入。
 设置与复位接口仅限主循环上下文，要求最近 3 秒内有有效 RTC；不要在 UART 或 SysTick 中断中调用。
 
-## 两组结构体
+## 上下文结构体
 
-参数仍归入两个全局结构体；应用读取显示结果前检查有效标志，不要绕过接口直接修改持久化参数。
+模块不再导出可写全局变量。调用方持有一个 `Maintenance_Context g_maintenance`，通过入口参数传递其地址；保存参数、运行状态、硬件状态分别归入 `save`、`state`、`port`。结构体类型采用首字母大写、下划线分词，结构体实例与指针采用 `g_` 加小写名称。读取显示结果前检查有效标志，不要绕过接口直接修改持久化参数。
+
+上下文必须在首次调用前清零，所有操作传入同一个有效指针，运行期间不能清零、复制后切换或销毁它。RA 适配器仍独占一组 SCI9/SysTick 和 EEPROM；上下文传参不代表单板可同时运行多个硬件实例。中断因固定签名无法接收入口参数，硬件层保留一个文件内静态绑定结构体，由初始化时绑定 `port`。
+
+实际工程的实例位于 `hal_entry()` 内，具有静态存储期和局部可见性；新增应用模块应通过参数接收它的地址。
 
 | 变量 | 主要字段 | 含义 |
 |---|---|---|
-| `Maintenance_save` | `machine / sensor` | 两项目的保存参数 |
+| `g_maintenance.save` | `machine / sensor` | 两项目的保存参数 |
 | | `*.period_days / *.start_day` | 天数周期及日历起点 |
 | | `*.period_hours / *.start_uptime_seconds` | 小时周期及开机秒数起点 |
 | | `uptime_seconds` | 最近一次成功保存的累计开机秒数 |
 | | `saved_day / sequence` | 保存日期水位与记录序号 |
-| `Maintenance_para` | `rtc / current_day` | 最近 RTC、以 2000-01-01 为 0 的日期序号 |
+| `g_maintenance.state` | `rtc / current_day` | 最近 RTC、以 2000-01-01 为 0 的日期序号 |
 | | `uptime_seconds / uptime_remainder_ms` | 当前累计开机秒数及不足一秒的部分 |
 | | `machine / sensor` | 两项目的过程变量 |
 | | `*.elapsed_days / *.remaining_days` | 已过天数不封顶；剩余天数到期为 0 |
@@ -79,7 +104,7 @@ Maintenance_ResetSensor();  // 传感器：两项一起重新开始
 ### 调试时一次性重置两项目
 
 1. 编译并下载新固件，运行到 RTC 正常，确认屏幕日期正确。
-2. 暂停，在 e² studio 的 Expressions 中将 `Maintenance_para.reset_all_request` 改为 `1`。
+2. 暂停并选中 `hal_entry` 调用栈帧，在 e² studio 的 Expressions 中将 `g_maintenance.state.reset_all_request` 改为 `1`。
 3. 恢复运行。主循环等待有效 RTC 和可用存储，用一次提交保存两项目的新起点。
 4. 请求自动变为 `0`，`reset_all_result == MAINTENANCE_OK`（0）表示成功。两项目均显示 `0天/周期天`、`0h/周期h`。
 
@@ -153,10 +178,10 @@ MCU 工程：在 e² studio 中打开 `Maintenance_Manager` 并编译。命令�
 python tools/check_maintenance.py
 ```
 
-脚本先运行主机测试，再用本机 ARM GCC 编译、链接，输出到 `tmp/maintenance-build`；可传 `--host-only`、`--arm-gcc`、`--host-gcc`。当前 `.gitignore` 忽略 `tests/`，跨电脑运行脚本需同时携带测试源文件。
+脚本先运行主机测试，再用本机 ARM GCC 编译、链接，输出到 `tmp/maintenance-build`；可传 `--host-only`、`--arm-gcc`、`--host-gcc`。回归测试随源码保存在 `tools/tests/`；根目录被忽略的 `tests/` 是原本的本地副本，不参与构建。测试通过包含功能层实现检查私有日期/RTC 辅助函数，不为测试增加生产导出接口。
 
 屏幕工程：使用 VisualTFT 打开 `VisualTFT/Project/Project.tftprj` 编译并下载。生成资源在 `VisualTFT/Project/output`，该目录忽略版本管理，源码和字体资源保留。
 
-验证覆盖：全部有效日历日期、天数与小时独立来源、分钟保存、断电不增加开机小时、亚秒累计和毫秒回绕、两种比例的主导切换、超周期数值、蓝/红颜色指令、两项目复位、v1/v2 升级、32 页循环、每个写入字节位置断电、读取失败与提交后回读失败恢复。
+验证覆盖：上下文与串口状态隔离、全部有效日历日期、天数与小时独立来源、分钟保存、断电不增加开机小时、亚秒累计和毫秒回绕、两种比例的主导切换、超周期数值、蓝/红颜色指令、两项目复位、v1/v2 升级、32 页循环、每个写入字节位置断电、读取失败与提交后回读失败恢复。
 
 主机测试和编译不能替代实屏协议、字体、电气时序、RTC 电池及 EEPROM 真实断电测试；当前未执行实板烧录。

@@ -1,7 +1,7 @@
 #ifndef MAINTENANCE_CONFIG_H
 #define MAINTENANCE_CONFIG_H
 
-/* All application-specific settings are collected here. */
+// 应用周期、任务调度与超时配置集中定义，单位由宏名标明。
 #define MAINTENANCE_DEFAULT_DAYS       180U
 #define MAINTENANCE_SENSOR_DEFAULT_DAYS 180U
 #define MAINTENANCE_MAX_DAYS           36500U
@@ -16,8 +16,7 @@
 #define MAINTENANCE_FRAME_TIMEOUT_MS   200U
 #define MAINTENANCE_DISPLAY_PERIOD_MS 1000U
 
-/* 24C256: A0/A1/A2 are grounded. Reserve a 32-page cyclic journal.
- * Do not allocate these addresses to other application settings. */
+// 24C256 的 A0/A1/A2 接地；预留 32 页循环日志区，其他模块不得占用。
 #define MAINTENANCE_EEPROM_ADDRESS     0x50U
 #define MAINTENANCE_EEPROM_SLOT0       0x7F00U
 #define MAINTENANCE_EEPROM_SLOT1       0x7F40U
@@ -25,9 +24,9 @@
 #define MAINTENANCE_EEPROM_JOURNAL_BASE 0x7800U
 #define MAINTENANCE_EEPROM_SLOT_COUNT  32U
 
-/* Screen0, display only. All maintenance logic runs on the MCU.
- * 0xFFFF disables an output. Dacai protocol, CRC disabled, 115200 8N1.
- * RTC control 10 displays the same system RTC read by command EE 82. */
+// Screen0 仅负责显示，业务逻辑由 MCU 执行；控件编号 0xFFFF 表示禁用对应输出。
+// 屏幕通信采用大彩协议，关闭 CRC，串口参数为 115200 波特率、8 数据位、无校验、1 停止位。
+// RTC 控件 10 显示的系统时间与指令 EE 82 查询的时间相同。
 #ifndef MAINTENANCE_SCREEN_ID
 #define MAINTENANCE_SCREEN_ID 0U
 #endif
@@ -42,8 +41,8 @@
 #define MAINTENANCE_SENSOR_HOURS_ID    18U
 #define MAINTENANCE_MACHINE_STATUS_ID  19U
 #define MAINTENANCE_SENSOR_STATUS_ID   20U
-#define MAINTENANCE_COLOR_NORMAL       0x2359U /* RGB565: 36,105,201 */
-#define MAINTENANCE_COLOR_DUE          0xC9E9U /* RGB565: 200,63,73 */
+#define MAINTENANCE_COLOR_NORMAL       0x2359U // 正常蓝色，RGB565 对应原始颜色分量 36、105、201。
+#define MAINTENANCE_COLOR_DUE          0xC9E9U // 到期红色，RGB565 对应原始颜色分量 200、63、73。
 
 #define MAINTENANCE_RX_SIZE            512U
 #define MAINTENANCE_FRAME_SIZE         1024U
